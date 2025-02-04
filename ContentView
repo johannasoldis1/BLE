@@ -1,0 +1,255 @@
+import SwiftUI
+import UniformTypeIdentifiers
+
+struct ContentView: View {
+    @ObservedObject var graph: emgGraph
+    @ObservedObject var BLE: BLEManager
+    @State private var showingExporter = false
+    @State var file_content: TextFile = TextFile(initialText: "")
+
+    var body: some View {
+        GeometryReader { geometry in
+            VStack(spacing: 10) {
+
+                // Raw EMG Graph
+                VStack {
+                    Text("Raw EMG Data")
+                        .font(.headline)
+                        .foregroundColor(.blue)
+
+                    Path { path in
+                        let height = geometry.size.height / 8
+                        let width = geometry.size.width
+
+                        guard graph.values.count > 1 else { return }
+
+                        let firstSample = max(0, graph.values.count - 200)
+                        let cutGraph = graph.values[firstSample..<graph.values.count].filter { $0.isFinite }
+
+                        guard cutGraph.count > 1 else { return }
+
+                        let midY = height / 2
+                        var isFirstPoint = true
+
+                        for (index, value) in cutGraph.enumerated() {
+                            let x = width * CGFloat(index) / CGFloat(max(cutGraph.count - 1, 1)) // ✅ Prevent division by zero
+                            let y = midY - height / 2 * value
+
+                            guard x.isFinite, y.isFinite else {
+                                print("Skipping invalid point: x=\(x), y=\(y)")
+                                isFirstPoint = true
+                                continue
+                            }
+
+                            if isFirstPoint {
+                                path.move(to: CGPoint(x: x, y: y))
+                                isFirstPoint = false
+                            } else {
+                                path.addLine(to: CGPoint(x: x, y: y))
+                            }
+                        }
+                    }
+                    .stroke(Color.blue, lineWidth: 1.5)
+                    .frame(height: geometry.size.height / 8)
+                }
+
+                // 100 sample RMS Graph
+                VStack {
+                    Text("100 sample RMS")
+                        .font(.headline)
+                        .foregroundColor(.red)
+
+                    Path { path in
+                        let height = geometry.size.height / 8
+                        let width = geometry.size.width
+                        let history = graph.shortTermRMSHistory.filter { $0.isFinite }
+
+                        guard history.count > 1 else { return }
+
+                        let midY = height / 2
+                        var isFirstPoint = true
+
+                        for (index, value) in history.enumerated() {
+                            let x = CGFloat(index) * width / CGFloat(max(history.count - 1, 1)) // ✅ Prevent division by zero
+                            let y = midY - height / 2 * value
+
+                            guard x.isFinite, y.isFinite else {
+                                print("Skipping invalid RMS point: x=\(x), y=\(y)")
+                                isFirstPoint = true
+                                continue
+                            }
+
+                            if isFirstPoint {
+                                path.move(to: CGPoint(x: x, y: y))
+                                isFirstPoint = false
+                            } else {
+                                path.addLine(to: CGPoint(x: x, y: y))
+                            }
+                        }
+                    }
+                    .stroke(Color.red, lineWidth: 2.0)
+                    .frame(height: geometry.size.height / 8)
+                }
+
+                // 1-Second RMS Graph
+                VStack {
+                    Text("1000 sample RMS")
+                        .font(.headline)
+                        .foregroundColor(.green)
+
+                    Path { path in
+                        let height = geometry.size.height / 12
+                        let width = geometry.size.width
+                        let history = graph.oneSecondRMSHistory.filter { $0.isFinite }
+
+                        guard history.count > 1 else { return }
+
+                        let midY = height / 2
+                        var isFirstPoint = true
+
+                        for (index, value) in history.enumerated() {
+                            let x = CGFloat(index) * width / CGFloat(max(history.count - 1, 1)) // ✅ Prevent division by zero
+                            let y = midY - height / 2 * value
+
+                            guard x.isFinite, y.isFinite else {
+                                print("Skipping invalid 1-sec RMS point: x=\(x), y=\(y)")
+                                isFirstPoint = true
+                                continue
+                            }
+
+                            if isFirstPoint {
+                                path.move(to: CGPoint(x: x, y: y))
+                                isFirstPoint = false
+                            } else {
+                                path.addLine(to: CGPoint(x: x, y: y))
+                            }
+                        }
+                    }
+                    .stroke(Color.green, lineWidth: 2.0)
+                    .frame(height: geometry.size.height / 12)
+                }
+                .padding(.top, 10)
+
+                if !BLE.isConnected {
+                    VStack {
+                        Text("Connect to Sensor")
+                            .font(.headline)
+
+                        List(BLE.BLEPeripherals) { peripheral in
+                            HStack {
+                                Text(peripheral.name).onTapGesture {
+                                    BLE.connectSensor(p: peripheral)
+                                }
+                                Spacer()
+                                Text("\(peripheral.rssi)")
+                            }
+                        }
+                        .frame(height: geometry.size.height / 10)
+                    }
+                } else {
+                    Text("Connected to EMGBLE2!")
+                        .font(.headline)
+                        .foregroundColor(.green)
+                }
+
+                VStack {
+                    Text("STATUS")
+                        .font(.headline)
+                    if BLE.BLEisOn {
+                        Text("Bluetooth is switched on")
+                            .foregroundColor(.green)
+                    } else {
+                        Text("Bluetooth is NOT switched on")
+                            .foregroundColor(.red)
+                    }
+                }
+
+                HStack {
+                    VStack(spacing: 5) {
+                        Button("Start Scanning") { BLE.startScanning() }
+                            .disabled(BLE.isConnected)
+
+                        Button("Stop Scanning") { BLE.stopScanning() }
+                            .disabled(!BLE.BLEisOn || BLE.isConnected)
+                    }
+                    .padding()
+
+                    Spacer()
+
+                    VStack(spacing: 5) {
+                        Button("Start Recording") {
+                            DispatchQueue.global(qos: .background).async {
+                                graph.record()
+                                DispatchQueue.main.async {
+                                    print("Recording started.")
+                                }
+                            }
+                        }
+
+                        Button("Stop Recording") {
+                            DispatchQueue.global(qos: .background).async {
+                                let fileContent = graph.stop_recording_and_save()
+                                DispatchQueue.main.async {
+                                    file_content.text = fileContent
+                                    print("Recording stopped and saved.")
+                                }
+                            }
+                        }
+
+                        Button("Export last") { showingExporter = true }
+                    }
+                    .padding()
+                }
+
+                HStack {
+                    Button("Reset Graphs") {
+                        graph.values.removeAll()
+                        graph.oneSecondRMSHistory.removeAll()
+                        graph.shortTermRMSHistory.removeAll()
+                        graph.max10SecRMSHistory.removeAll()
+                    }
+                    .foregroundColor(.red)
+
+                    Spacer()
+
+                    Button("Refresh Graphs") {
+                        graph.objectWillChange.send()
+                    }
+                    .foregroundColor(.blue)
+                }
+            }
+            .padding(10)
+            .fileExporter(isPresented: $showingExporter, document: file_content, contentType: .commaSeparatedText, defaultFilename: "emg-data") { result in
+                switch result {
+                case .success(let url):
+                    print("Saved to \(url)")
+                case .failure(let error):
+                    print(error.localizedDescription)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+struct TextFile: FileDocument {
+    static var readableContentTypes = [UTType.commaSeparatedText]
+    static var preferredFilenameExtension: String? { "csv" }
+    var text = ""
+
+    init(initialText: String = "") {
+        text = initialText
+    }
+
+    init(configuration: ReadConfiguration) throws {
+        if let data = configuration.file.regularFileContents {
+            text = String(decoding: data, as: UTF8.self)
+        }
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        let data = Data(text.utf8)
+        return FileWrapper(regularFileWithContents: data)
+    }
+}
+
