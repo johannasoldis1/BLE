@@ -1,0 +1,393 @@
+//
+//  BLEManager.swift
+//  EMG-ble-kth
+//
+
+import Foundation
+import CoreBluetooth
+import QuartzCore // for time
+
+struct Peripheral: Identifiable {
+    let id: Int
+    let name: String
+    let rssi: Int
+}
+
+class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
+    var myCentral: CBCentralManager!
+    @Published var BLEisOn = false
+    @Published var BLEPeripherals = [Peripheral]()
+    @Published var isConnected = false
+    var CBPeripherals = [CBPeripheral]()
+    var emg: emgGraph
+
+    // RMS Buffers and Calculation
+    private var emgBuffer: [Float] = [] // Buffer for 0.1-second RMS calculation
+    private let windowSize = 1 // 0.1 seconds at 10 Hz sampling rate
+    @Published var currentRMS: Float = 0.0 // Latest 0.1-second RMS
+    @Published var rmsHistory: [Float] = [] // Store historical 0.1-second RMS values
+
+    private var oneSecondBuffer: [Float] = [] // Buffer for 1-second RMS calculation
+    private let oneSecondWindowSize = 10 // 1 second at 10 Hz sampling rate
+    @Published var oneSecondRMS: Float = 0.0 // Latest 1-second RMS
+
+    private let dataQueue = DispatchQueue(label: "com.emg.ble.data")
+    
+    var notificationTimestamps: [CFTimeInterval] = [] // Stores timestamps for debugging
+    var notificationSamples: [Int] = [] // Stores sample counts per notification
+    
+    var firstSampleTimestamp: CFTimeInterval? // Stores first timestamp as reference
+    var expectedNextTimestamp: CFTimeInterval? // Expected timestamp for next sample
+    
+    private var receivedValuesPerTimestamp: [CFTimeInterval: [Float]] = [:] // Rolling buffer for tracking received values
+    private let rollingBufferLimit = 50 // Stores data for the last 5 seconds (assuming 10 Hz updates)
+    private var totalPacketsReceived = 0
+    private var totalPacketsExpected = 0
+
+    init(emg: emgGraph) {
+        self.emg = emg
+        super.init()
+        myCentral = CBCentralManager(delegate: self, queue: nil)
+    }
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        DispatchQueue.main.async {
+            self.BLEisOn = (central.state == .poweredOn)
+        }
+    }
+
+    func checkBluetoothPermissions() {
+        switch myCentral.authorization {
+        case .allowedAlways:
+            print("Bluetooth is allowed")
+        case .restricted, .denied:
+            print("Bluetooth access denied")
+        default:
+            print("Bluetooth authorization pending")
+        }
+    }
+
+    func startScanning() {
+        guard !isConnected else {
+            print("Already connected, skipping scanning.")
+            return
+        }
+        print("Start Scanning")
+        BLEPeripherals.removeAll()
+        CBPeripherals.removeAll()
+        myCentral.scanForPeripherals(withServices: nil)
+    }
+
+    func stopScanning() {
+        print("Stop Scanning")
+        myCentral.stopScan()
+    }
+
+    func connectSensor(p: Peripheral) {
+        guard p.id < CBPeripherals.count else {
+            print("Invalid peripheral ID")
+            return
+        }
+        myCentral.connect(CBPeripherals[p.id])
+    }
+
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        // Check for Manufacturer Specific Data
+        if let manufacturerData = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
+           manufacturerData.count >= 2 {
+            let companyID = UInt16(manufacturerData[1]) << 8 | UInt16(manufacturerData[0]) // Little-endian
+            if companyID != 0x05DA { // Check for ANR's company ID
+                print("Skipping non-ANR device")
+                return
+            }
+        } else {
+            print("No Manufacturer Specific Data found, skipping device.")
+            return
+        }
+
+        // Extract the device name (if available)
+        let peripheralName = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? "Unknown"
+        print("Discovered device: \(peripheralName) with RSSI: \(RSSI.intValue)")
+
+        // Add the discovered device to the list
+        let newPeripheral = Peripheral(id: BLEPeripherals.count, name: peripheralName, rssi: RSSI.intValue)
+        DispatchQueue.main.async {
+            self.BLEPeripherals.append(newPeripheral)
+        }
+        CBPeripherals.append(peripheral)
+
+        print("Added device: \(peripheralName) with RSSI: \(RSSI.intValue)")
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        print("Connected to \(peripheral.name ?? "Unknown Device")")
+        DispatchQueue.main.async {
+            self.isConnected = true
+        }
+        myCentral.stopScan()
+        peripheral.delegate = self
+        peripheral.discoverServices(nil)
+    }
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        print("Disconnected from \(peripheral.name ?? "Unknown Device")")
+        DispatchQueue.main.async {
+            self.isConnected = false
+        }
+    }
+    
+    func processAndAppendEMGData(_ rawEMGData: [Float], timestamp: CFTimeInterval) {
+        guard !rawEMGData.isEmpty else {
+            print("Error: Received empty EMG data.")
+            return
+        }
+
+        // Debugging: Check for NaN or infinite values in raw data
+        if rawEMGData.contains(where: { !$0.isFinite }) {
+            print("WARNING: NaN or infinite values detected in received EMG data! Filtering out invalid values.")
+        }
+
+        // Remove NaN and infinite values before further processing
+        let sanitizedData = rawEMGData.filter { $0.isFinite }
+
+        if sanitizedData.isEmpty {
+            print("WARNING: All received EMG values were invalid, skipping update.")
+            return
+        }
+
+        // Ensure only valid CGFloat values are passed
+        let sanitizedCGFloatData = sanitizedData.map { CGFloat($0) }
+
+        // Final validation before appending (Check if all values are finite)
+        guard sanitizedCGFloatData.allSatisfy({ $0.isFinite }) else {
+            print("ERROR: Non-finite values detected in sanitized EMG data before appending. Skipping.")
+            return
+        }
+
+        // Debug log before appending data
+        print("Appending EMG Data: \(sanitizedCGFloatData), Timestamp: \(timestamp)")
+
+        let testData = sanitizedCGFloatData // Keep data unchanged
+
+        // Dispatch safely to the main thread
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else {
+                print("ERROR: BLEManager instance is nil, cannot append values.")
+                return
+            }
+            self.emg.append(values: testData, timestamp: timestamp)
+        }
+
+        // Call RMS calculation functions with sanitized values
+        updateShortTermRMS(with: sanitizedData)
+        updateOneSecondRMS(with: sanitizedData)
+    }
+
+    // RMS Calculations and Updates
+    func updateShortTermRMS(with newValues: [Float]) {
+        dataQueue.async {
+            // Filter out NaN values before appending
+            let validValues = newValues.filter { !$0.isNaN }
+
+            // Append valid values to the buffer
+            self.emgBuffer.append(contentsOf: validValues)
+
+            // Maintain a buffer for 0.1-second RMS
+            if self.emgBuffer.count > self.windowSize {
+                self.emgBuffer.removeFirst(self.emgBuffer.count - self.windowSize)
+            }
+
+            if self.emgBuffer.count == self.windowSize {
+                // Calculate RMS for 0.1-second interval
+                let shortTermRMS = self.calculateRMS(from: self.emgBuffer)
+
+                DispatchQueue.main.async {
+                    self.currentRMS = shortTermRMS
+                    self.rmsHistory.append(shortTermRMS)
+                    if self.rmsHistory.count > 100 {
+                        self.rmsHistory.removeFirst()
+                    }
+
+                    // Add short-term RMS to emgGraph
+                    self.emg.shortTermRMSHistory.append(CGFloat(shortTermRMS))
+                }
+
+                print("Short-Term RMS (0.1s): \(shortTermRMS)")
+            }
+        }
+    }
+    
+    func updateOneSecondRMS(with newValues: [Float]) {
+        dataQueue.async {
+            // Filter out NaN values before appending
+            let validValues = newValues.filter { !$0.isNaN }
+
+            // Append valid values to the buffer
+            self.oneSecondBuffer.append(contentsOf: validValues)
+
+            // Maintain a buffer for 1-second RMS
+            if self.oneSecondBuffer.count > self.oneSecondWindowSize {
+                self.oneSecondBuffer.removeFirst(self.oneSecondBuffer.count - self.oneSecondWindowSize)
+            }
+
+            if self.oneSecondBuffer.count == self.oneSecondWindowSize {
+                // Calculate RMS for 1-second interval
+                let oneSecRMS = self.calculateRMS(from: self.oneSecondBuffer)
+
+                DispatchQueue.main.async {
+                    self.oneSecondRMS = oneSecRMS
+
+                    // Add one-second RMS to emgGraph
+                    self.emg.oneSecondRMSHistory.append(CGFloat(oneSecRMS))
+                }
+
+                print("1-Second RMS: \(oneSecRMS)")
+            }
+        }
+    }
+    
+    func calculateRMS(from samples: [Float]) -> Float {
+        // Remove NaN or infinite values before calculation
+        let validSamples = samples.filter { $0.isFinite }
+
+        guard !validSamples.isEmpty else {
+            print("WARNING: No valid samples available for RMS calculation. Returning 0.0 to avoid NaN.")
+            return 0.0
+        }
+
+        let squaredSum = validSamples.reduce(0.0) { $0 + $1 * $1 }
+        return sqrt(squaredSum / Float(validSamples.count))
+    }
+    
+    func calculateSignalAcquisitionRatio() {
+        let sar = (totalPacketsReceived > 0) ? (Double(totalPacketsReceived) / Double(totalPacketsExpected)) * 100 : 0.0
+        print("📡 Signal Acquisition Ratio (SAR): \(sar)%")
+    }
+}
+
+extension BLEManager: CBPeripheralDelegate {
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        if let error = error {
+            print("Error discovering services: \(error.localizedDescription)")
+            return
+        }
+        guard let services = peripheral.services else { return }
+        for service in services {
+            peripheral.discoverCharacteristics(nil, for: service)
+        }
+    }
+    
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        if let error = error {
+            print("Error discovering characteristics: \(error.localizedDescription)")
+            return
+        }
+        guard let characteristics = service.characteristics else { return }
+        
+        for characteristic in characteristics {
+            switch characteristic.uuid {
+            case CBUUID(string: "2A58"): // Analog (EMG data)
+                print("Found Analog characteristic (EMG data)")
+                peripheral.setNotifyValue(true, for: characteristic)
+            case CBUUID(string: "2A56"): // Digital (Device ID Color)
+                print("Found Digital characteristic (Device ID Color)")
+                // Write color ID as needed
+            case CBUUID(string: "2A19"): // Battery Level
+                print("Found Battery Level characteristic")
+                peripheral.readValue(for: characteristic)
+            default:
+                print("Unhandled characteristic UUID: \(characteristic.uuid)")
+            }
+        }
+    }
+    
+    func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        if let error = error {
+            print("Error updating value for characteristic: \(error.localizedDescription)")
+            return
+        }
+
+        switch characteristic.uuid {
+        case CBUUID(string: "2A58"): // EMG Data
+            guard let characteristicData = characteristic.value, characteristicData.count % 2 == 0 else {
+                print("Error: Invalid data length for EMG characteristic")
+                return
+            }
+
+            let numberOfValues = characteristicData.count / 2 // 2 bytes per sample
+            let systemTimestamp = CACurrentMediaTime() // Capture system timestamp
+
+            var rawValues: [Float] = []
+            for index in stride(from: 0, to: characteristicData.count, by: 2) {
+                let rawValue = UInt16(characteristicData[index]) | (UInt16(characteristicData[index + 1]) << 8)
+                let normalizedValue = Float(rawValue) / 1023.0
+                rawValues.append(normalizedValue.isFinite ? normalizedValue : 0.0) // ✅ Ensure no NaN
+            }
+
+            if firstSampleTimestamp == nil {
+                firstSampleTimestamp = systemTimestamp
+                expectedNextTimestamp = firstSampleTimestamp // Initialize expected time
+            }
+            
+            let timestamp: CFTimeInterval
+            if let expectedTime = expectedNextTimestamp {
+                let timeDifference = systemTimestamp - expectedTime
+
+                if timeDifference > 0.02 { // Detect missing packets
+                    print("⚠️ Packet loss detected! Inserting NaN values.")
+
+                    while expectedNextTimestamp! + 0.1 < systemTimestamp {
+                        print("Filling missing timestamp: \(expectedNextTimestamp!) (NaN inserted)")
+
+                        receivedValuesPerTimestamp[expectedNextTimestamp!] = [Float.nan]
+                        
+                        expectedNextTimestamp! += 0.1 // ✅ Ensure timestamp progresses
+                        totalPacketsExpected += 1
+
+                        if expectedNextTimestamp! > systemTimestamp {
+                            break // ✅ Ensures we do not loop infinitely if timestamps are mismatched
+                        }
+                    }
+                }
+                print("Time Difference: \(timeDifference)")
+
+                if abs(timeDifference) > 0.015 {
+                    print("⏳ Timestamp drift detected! Resyncing.")
+                    timestamp = systemTimestamp
+                    if expectedNextTimestamp! < systemTimestamp {
+                        expectedNextTimestamp = systemTimestamp + 0.1
+                    }
+                } else {
+                    timestamp = expectedTime
+                    expectedNextTimestamp = expectedTime + 0.1
+                }
+            } else {
+                timestamp = systemTimestamp
+            }
+
+            // Store received values for the timestamp
+            receivedValuesPerTimestamp[timestamp] = rawValues
+            totalPacketsReceived += 1
+            totalPacketsExpected += 1
+
+            // Remove old timestamps to prevent continuous looping
+            if receivedValuesPerTimestamp.count >= rollingBufferLimit {
+                let oldestKey = receivedValuesPerTimestamp.keys.sorted().first!
+                print("🔄 Removing oldest timestamp: \(oldestKey) to prevent buffer overflow")
+                receivedValuesPerTimestamp.removeValue(forKey: oldestKey)
+            }
+
+            print("📊 Timestamp: \(timestamp) | Received \(rawValues.count) EMG samples")
+
+            // Calculate Signal Acquisition Ratio (SAR)
+            calculateSignalAcquisitionRatio()
+
+            DispatchQueue.main.async {
+                self.processAndAppendEMGData(rawValues, timestamp: timestamp)
+            }
+
+        default:
+            print("Unhandled characteristic UUID: \(characteristic.uuid)")
+        }
+    }
+}
