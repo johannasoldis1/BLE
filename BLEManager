@@ -272,36 +272,31 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
         
         // Step 2: If the buffer exceeds the size limit, process the data
         if timestampBuffer.count > bufferLimit {
-            // Get the two oldest timestamps in the buffer
-            let (oldestTimestamp, _) = timestampBuffer.first!
-            let (nextOldestTimestamp, _) = timestampBuffer[1]
-            
-            // Step 3: Calculate the time difference between the oldest and the next-oldest timestamps
-            let timeDifference = nextOldestTimestamp - oldestTimestamp
-            print("Time difference between oldest and next-oldest: \(timeDifference)")  // Debugging
-            
-            // Step 4: If the time difference exceeds 0.8 seconds, assume a missing value
-            if timeDifference > 0.8 {
-                print("⚠️ Missing packet detected! Inserting NaN values.")
-                
-                // Insert NaN values for the missing timestamps
-                // Ensure we progress from the oldest timestamp + 0.1 seconds to nextOldestTimestamp
-                for missingTime in stride(from: oldestTimestamp + 0.1, to: nextOldestTimestamp, by: 0.1) {
-                    // Insert NaN data for the missing timestamp
-                    if receivedValuesPerTimestamp[missingTime] == nil {
-                        receivedValuesPerTimestamp[missingTime] = [Float.nan]
-                        print("Inserting NaN at timestamp: \(missingTime)")
-                    }
-                }
-            }
-            
-            // Step 5: Remove the oldest entry to maintain the buffer size
+            // Remove the oldest entry to maintain the buffer size
             timestampBuffer.removeFirst()
         }
         
-        // Step 6: Process and append the EMG data (after filling in missing packets)
+        // Step 3: Handle missing packets (time difference between oldest and next oldest timestamp)
+        if timestampBuffer.count > 1 {
+            let (oldestTimestamp, _) = timestampBuffer.first!
+            let (nextOldestTimestamp, _) = timestampBuffer[1]
+            
+            // Step 4: If the time difference exceeds 0.8 seconds, assume a missing packet
+            let timeDifference = nextOldestTimestamp - oldestTimestamp
+            if timeDifference > 0.8 {
+                print("⚠️ Missing packet detected! Inserting NaN values.")
+                
+                // Insert NaN values for missing timestamps between oldest and next
+                for missingTime in stride(from: oldestTimestamp + 0.1, to: nextOldestTimestamp, by: 0.1) {
+                    print("Inserting NaN at timestamp: \(missingTime)")
+                    // You can append NaN directly to the buffer or handle it differently if required
+                    timestampBuffer.append((missingTime, [Float.nan]))
+                }
+            }
+        }
+        
+        // Step 5: Process and append the EMG data after checking for missing packets
         DispatchQueue.main.async { [weak self] in
-            // Always ensure this update happens on the main thread
             self?.processAndAppendEMGData(rawEMGData, timestamp: timestamp)
         }
     }
@@ -367,7 +362,7 @@ extension BLEManager: CBPeripheralDelegate {
             var rawValues: [Float] = []
             for index in stride(from: 0, to: characteristicData.count, by: 2) {
                 let rawValue = UInt16(characteristicData[index]) | (UInt16(characteristicData[index + 1]) << 8)
-                let normalizedValue = Float(rawValue) / 1023.0
+                let normalizedValue = Float(rawValue) / 1000.0 // 1000 for this device since values from 0-1000
                 rawValues.append(normalizedValue.isFinite ? normalizedValue : 0.0) // ✅ Ensure no NaN
             }
             
