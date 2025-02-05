@@ -307,9 +307,56 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
             }
         }
         
-        // Step 4: Process and append the EMG data after checking for missing packets
+        // Step 4: Reconstruct the data stream based on buffered data
+        reconstructDataStream()
+
+        // Step 5: Process and append the EMG data after checking for missing packets
         DispatchQueue.main.async { [weak self] in
             self?.processAndAppendEMGData(rawEMGData, timestamp: timestamp)
+        }
+    }
+
+    func reconstructDataStream() {
+        var reconstructedData: [(CFTimeInterval, [Float])] = []
+        
+        // Step 1: Sort the timestamp buffer based on timestamp order
+        let sortedTimestampBuffer = timestampBuffer.sorted { $0.0 < $1.0 }
+        
+        // Step 2: Iterate through the sorted buffer and reconstruct the data stream
+        var lastTimestamp: CFTimeInterval? = nil
+        for (timestamp, data) in sortedTimestampBuffer {
+            if let lastTimestamp = lastTimestamp {
+                // Check for time difference between the last timestamp and the current one
+                let timeDifference = timestamp - lastTimestamp
+                
+                // If there's a gap larger than expected (e.g., > 0.1s), insert NaN data
+                if timeDifference > 0.1 {
+                    print("⚠️ Gap detected between timestamps: \(lastTimestamp) and \(timestamp). Inserting missing data.")
+                    
+                    var currentTime = lastTimestamp + 0.1 // Start inserting from the next expected timestamp
+                    while currentTime < timestamp {
+                        // Insert NaN for missing data points
+                        reconstructedData.append((currentTime, [Float.nan]))
+                        currentTime += 0.1
+                    }
+                }
+            }
+            
+            // Append the current data entry to the reconstructed data
+            reconstructedData.append((timestamp, data))
+            lastTimestamp = timestamp // Update the last timestamp
+        }
+        
+        // Step 3: Log the reconstructed data for debugging
+        for (timestamp, data) in reconstructedData {
+            print("Reconstructed Data - Timestamp: \(timestamp), Data: \(data)")
+        }
+        
+        // Optional: Store or process reconstructed data further
+        // Example: Update a graph, log data, or further analysis.
+        DispatchQueue.main.async {
+            // Use the reconstructed data as needed for your application
+            // e.g., update UI or append it to emgGraph
         }
     }
     
