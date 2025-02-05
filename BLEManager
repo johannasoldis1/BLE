@@ -44,8 +44,8 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
     private var totalPacketsReceived = 0
     private var totalPacketsExpected = 0
     
-    // Define buffer size for 10 values
-    private var timestampBuffer: [(CFTimeInterval, [Float])] = [] // Buffer for storing EMG data with timestamps
+    // Buffer for storing EMG data with timestamps (each entry includes data and the timestamp)
+    private var timestampBuffer: [(CFTimeInterval, [Float])] = []
     private let bufferLimit = 10 // Limit the buffer size to 10 values
     
     init(emg: emgGraph) {
@@ -175,10 +175,8 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
         
         // Dispatch safely to the main thread
         DispatchQueue.main.async { [weak self] in
-            guard let self = self else {
-                print("ERROR: BLEManager instance is nil, cannot append values.")
-                return
-            }
+            guard let self = self else { return }
+            // Ensure UI updates are done on the main thread
             self.emg.append(values: rawEMGData.map { CGFloat($0) }, timestamp: timestamp)
         }
         
@@ -265,14 +263,13 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
         let squaredSum = validSamples.reduce(0.0) { $0 + $1 * $1 }
         return sqrt(squaredSum / Float(validSamples.count))
     }
-    
+
     func processEMGDataWithBuffer(rawEMGData: [Float], timestamp: CFTimeInterval) {
         // Step 1: Add the new data to the buffer
         timestampBuffer.append((timestamp, rawEMGData))
         
         // Step 2: If the buffer exceeds the size limit, process the data
         if timestampBuffer.count > bufferLimit {
-            // Remove the oldest entry to maintain the buffer size
             timestampBuffer.removeFirst()
         }
         
@@ -281,21 +278,36 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
             let (oldestTimestamp, _) = timestampBuffer.first!
             let (nextOldestTimestamp, _) = timestampBuffer[1]
             
-            // Step 4: If the time difference exceeds 0.8 seconds, assume a missing packet
+            // Log the current timestamps for debugging
+            print("Oldest Timestamp: \(oldestTimestamp), Next Oldest Timestamp: \(nextOldestTimestamp)")
+            
+            // Check if the time difference is larger than 0.8 seconds (missing packet)
             let timeDifference = nextOldestTimestamp - oldestTimestamp
+            print("Time difference between oldest and next timestamp: \(timeDifference)")
+            
             if timeDifference > 0.8 {
                 print("⚠️ Missing packet detected! Inserting NaN values.")
                 
-                // Insert NaN values for missing timestamps between oldest and next
-                for missingTime in stride(from: oldestTimestamp + 0.1, to: nextOldestTimestamp, by: 0.1) {
-                    print("Inserting NaN at timestamp: \(missingTime)")
-                    // You can append NaN directly to the buffer or handle it differently if required
-                    timestampBuffer.append((missingTime, [Float.nan]))
+                // Insert NaN values for missing timestamps between the oldest and next timestamp
+                let stepTime: CFTimeInterval = 0.1  // 100ms step
+                var currentTime = oldestTimestamp + stepTime
+                
+                // Instead of an infinite loop, we check if currentTime is progressing
+                while currentTime < nextOldestTimestamp {
+                    // Check if the current time is already in the buffer to avoid duplicates
+                    let isDuplicate = timestampBuffer.contains { $0.0 == currentTime }
+                    
+                    if !isDuplicate {
+                        print("Inserting NaN at timestamp: \(currentTime)")
+                        timestampBuffer.append((currentTime, [Float.nan]))  // Insert NaN values
+                    }
+                    
+                    currentTime += stepTime
                 }
             }
         }
         
-        // Step 5: Process and append the EMG data after checking for missing packets
+        // Step 4: Process and append the EMG data after checking for missing packets
         DispatchQueue.main.async { [weak self] in
             self?.processAndAppendEMGData(rawEMGData, timestamp: timestamp)
         }
@@ -356,50 +368,47 @@ extension BLEManager: CBPeripheralDelegate {
                 return
             }
             
-            let numberOfValues = characteristicData.count / 2 // 2 bytes per sample
             let systemTimestamp = CACurrentMediaTime() // Capture system timestamp
-            
             var rawValues: [Float] = []
             for index in stride(from: 0, to: characteristicData.count, by: 2) {
                 let rawValue = UInt16(characteristicData[index]) | (UInt16(characteristicData[index + 1]) << 8)
-                let normalizedValue = Float(rawValue) / 1000.0 // 1000 for this device since values from 0-1000
-                rawValues.append(normalizedValue.isFinite ? normalizedValue : 0.0) // ✅ Ensure no NaN
+                let normalizedValue = Float(rawValue) / 1000.0 // Normalize the value between 0-1000
+                rawValues.append(normalizedValue.isFinite ? normalizedValue : 0.0) // Ensure no NaN
             }
             
+            // If firstSampleTimestamp is nil, initialize it
             if firstSampleTimestamp == nil {
                 firstSampleTimestamp = systemTimestamp
                 expectedNextTimestamp = firstSampleTimestamp // Initialize expected time
             }
             
-            let timestamp: CFTimeInterval
+            var timestamp: CFTimeInterval
             if let expectedTime = expectedNextTimestamp {
                 let timeDifference = systemTimestamp - expectedTime
                 
                 if abs(timeDifference) > 0.02 { // Detect missing packets
                     print("⚠️ Packet loss detected! Inserting NaN values.")
                     
-                    // Only fill missing timestamps if expectedNextTimestamp is valid and doesn't overlap with existing data
+                    // Insert missing timestamps with NaN values
                     while expectedNextTimestamp! + 0.1 < systemTimestamp {
                         print("Filling missing timestamp: \(expectedNextTimestamp!) (NaN inserted)")
-
+                        
                         // Only insert NaN if this timestamp is not already in the receivedValuesPerTimestamp
                         if receivedValuesPerTimestamp[expectedNextTimestamp!] == nil {
                             receivedValuesPerTimestamp[expectedNextTimestamp!] = [Float.nan]
                             totalPacketsExpected += 1
                         }
-
+                        
                         expectedNextTimestamp! += 0.1 // Increment expectedNextTimestamp
-
-                        // Ensure the loop breaks if expectedNextTimestamp exceeds systemTimestamp
                         if expectedNextTimestamp! > systemTimestamp {
-                            break // Ensures we do not loop infinitely if timestamps are mismatched
+                            break // Avoid infinite loops and ensure we do not overlap with the current time
                         }
                     }
                 }
-
-                // Normal case: Process the current timestamp when there’s no packet loss
+                
+                // Process the current timestamp when no packet loss is detected
                 timestamp = expectedTime
-                expectedNextTimestamp = expectedTime + 0.1 // Move to the next expected timestamp
+                expectedNextTimestamp = expectedTime + 0.1 // Update expected next timestamp
             } else {
                 // If expectedNextTimestamp is nil, initialize it with the current systemTimestamp
                 timestamp = systemTimestamp
@@ -411,7 +420,7 @@ extension BLEManager: CBPeripheralDelegate {
             totalPacketsReceived += 1
             totalPacketsExpected += 1
             
-            // Remove old timestamps to prevent continuous looping
+            // Remove old timestamps to prevent overflow
             if receivedValuesPerTimestamp.count >= rollingBufferLimit {
                 let oldestKey = receivedValuesPerTimestamp.keys.sorted().first!
                 print("🔄 Removing oldest timestamp: \(oldestKey) to prevent buffer overflow")
@@ -426,7 +435,7 @@ extension BLEManager: CBPeripheralDelegate {
             DispatchQueue.main.async {
                 self.processAndAppendEMGData(rawValues, timestamp: timestamp)
             }
-            
+
         default:
             print("Unhandled characteristic UUID: \(characteristic.uuid)")
         }
