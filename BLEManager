@@ -268,7 +268,7 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
         // Step 1: Add the new data to the buffer
         timestampBuffer.append((timestamp, rawEMGData))
         
-        // Step 2: If the buffer exceeds the size limit, process the data
+        // Step 2: If the buffer exceeds the size limit, remove the oldest entry
         if timestampBuffer.count > bufferLimit {
             timestampBuffer.removeFirst()
         }
@@ -292,9 +292,9 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
                 let stepTime: CFTimeInterval = 0.1  // 100ms step
                 var currentTime = oldestTimestamp + stepTime
                 
-                // Instead of an infinite loop, we check if currentTime is progressing
+                // Insert missing timestamps until currentTime reaches nextOldestTimestamp
                 while currentTime < nextOldestTimestamp {
-                    // Check if the current time is already in the buffer to avoid duplicates
+                    // Ensure no duplicates are inserted
                     let isDuplicate = timestampBuffer.contains { $0.0 == currentTime }
                     
                     if !isDuplicate {
@@ -441,3 +441,4 @@ extension BLEManager: CBPeripheralDelegate {
         }
     }
 }
+
