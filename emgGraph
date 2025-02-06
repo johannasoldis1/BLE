@@ -67,12 +67,11 @@ class emgGraph: ObservableObject {
         dataset += "Sample,System Timestamp (s),EMG (Raw Data),0.1s RMS,1s RMS\n"
         
         for (index, rawValue) in recorded_values.enumerated() {
-            let sampleIndex = index
             let systemTimestamp = timestamps.indices.contains(index) ? timestamps[index] : 0.0
-            
             var shortTermRMS: Float = 0.0
             var oneSecondRMS: Float = 0.0
             
+            // Calculate RMS for the relevant intervals
             if index % self.shortTermRMSWindowSize == 0 && index / self.shortTermRMSWindowSize < self.shortTermRMSValues.count {
                 shortTermRMS = self.shortTermRMSValues[index / self.shortTermRMSWindowSize]
             }
@@ -81,7 +80,12 @@ class emgGraph: ObservableObject {
                 oneSecondRMS = Float(self.recorded_rms[index / self.oneSecondRMSWindowSize]) // Convert CGFloat to Float
             }
             
-            dataset += "\(sampleIndex),\(systemTimestamp),\(rawValue),\(shortTermRMS),\(oneSecondRMS)\n"
+            // Replace NaN with 0.0
+            let emgData = rawValue.isNaN ? "0.0" : "\(rawValue)"
+            let rmsShortTerm = shortTermRMS.isNaN ? "0.0" : "\(shortTermRMS)"
+            let rmsOneSecond = oneSecondRMS.isNaN ? "0.0" : "\(oneSecondRMS)"
+            
+            dataset += "\(index),\(systemTimestamp),\(emgData),\(rmsShortTerm),\(rmsOneSecond)\n"
         }
         
         saveToFile(dataset)
@@ -124,12 +128,12 @@ class emgGraph: ObservableObject {
     
     func calculateRMS(from samples: [Float]) -> Float {
         let validSamples = samples.filter { $0.isFinite }
-
+        
         guard !validSamples.isEmpty else {
             print("WARNING: All samples were NaN, returning 0.0 instead.")
             return 0.0
         }
-
+        
         let squaredSum = validSamples.reduce(0.0) { $0 + $1 * $1 }
         return sqrt(squaredSum / Float(validSamples.count))
     }
@@ -212,4 +216,3 @@ class emgGraph: ObservableObject {
         }
     }
 }
-
