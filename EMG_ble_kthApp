@@ -1,0 +1,17 @@
+//
+//  EMG_ble_kthApp.swift
+//  EMG-ble-kth
+
+import SwiftUI
+
+@main
+struct EMGApp: App {
+    var body: some Scene {
+        let emgGraphInstance = emgGraph(firstValues: [])
+        let bleManagerInstance = BLEManager(emg: emgGraphInstance)
+
+        WindowGroup {
+            ContentView(emgGraph: emgGraphInstance, bleManager: bleManagerInstance)
+        }
+    }
+}
