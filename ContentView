@@ -2,254 +2,346 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
-    @ObservedObject var graph: emgGraph
-    @ObservedObject var BLE: BLEManager
+    @StateObject var emgGraph: emgGraph
+    @StateObject var bleManager: BLEManager
     @State private var showingExporter = false
+    @State private var isExporting = false
     @State var file_content: TextFile = TextFile(initialText: "")
-
+    
+    
+    struct TextFile: FileDocument {
+        static var readableContentTypes = [UTType.commaSeparatedText]
+        var text: String
+        
+        init(initialText: String = "") {
+            self.text = initialText
+        }
+        
+        init(configuration: ReadConfiguration) throws {
+            if let data = configuration.file.regularFileContents {
+                text = String(decoding: data, as: UTF8.self)
+            } else {
+                text = ""
+            }
+        }
+        
+        func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+            let data = text.data(using: .utf8) ?? Data()
+            return FileWrapper(regularFileWithContents: data)
+        }
+    }
+    // Function to apply moving average smoothing
+    func smoothData(values: [CGFloat], windowSize: Int) -> [CGFloat] {
+        var smoothedValues: [CGFloat] = []
+        for i in 0..<values.count {
+            let start = max(0, i - windowSize / 2)
+            let end = min(values.count - 1, i + windowSize / 2)
+            let window = values[start...end]
+            let average = window.reduce(0, +) / CGFloat(window.count)
+            smoothedValues.append(average)
+        }
+        return smoothedValues
+    }
+    
+    init(emgGraph: emgGraph, bleManager: BLEManager) {
+        _emgGraph = StateObject(wrappedValue: emgGraph)
+        _bleManager = StateObject(wrappedValue: bleManager)
+    }
+    
     var body: some View {
         GeometryReader { geometry in
             VStack(spacing: 10) {
-
                 // Raw EMG Graph
                 VStack {
                     Text("Raw EMG Data")
                         .font(.headline)
                         .foregroundColor(.blue)
-
-                    Path { path in
-                        let height = geometry.size.height / 8
-                        let width = geometry.size.width
-
-                        guard graph.values.count > 1 else { return }
-
-                        let firstSample = max(0, graph.values.count - 200)
-                        let cutGraph = graph.values[firstSample..<graph.values.count].filter { $0.isFinite }
-
-                        guard cutGraph.count > 1 else { return }
-
-                        let midY = height / 2
-                        var isFirstPoint = true
-
-                        for (index, value) in cutGraph.enumerated() {
-                            let x = width * CGFloat(index) / CGFloat(max(cutGraph.count - 1, 1)) // ✅ Prevent division by zero
-                            let y = midY - height / 2 * value
-
-                            guard x.isFinite, y.isFinite else {
-                                print("Skipping invalid point: x=\(x), y=\(y)")
-                                isFirstPoint = true
-                                continue
-                            }
-
-                            if isFirstPoint {
-                                path.move(to: CGPoint(x: x, y: y))
-                                isFirstPoint = false
-                            } else {
-                                path.addLine(to: CGPoint(x: x, y: y))
-                            }
+                        .onAppear {
+                            print("🔄 UI Refresh (onAppear): \(emgGraph.values.count) points in view.")
                         }
-                    }
-                    .stroke(Color.blue, lineWidth: 1.5)
-                    .frame(height: geometry.size.height / 8)
-                }
-
-                // 100 sample RMS Graph
-                VStack {
-                    Text("100 sample RMS")
-                        .font(.headline)
-                        .foregroundColor(.red)
-
-                    Path { path in
-                        let height = geometry.size.height / 8
-                        let width = geometry.size.width
-                        let history = graph.shortTermRMSHistory.filter { $0.isFinite }
-
-                        guard history.count > 1 else { return }
-
-                        let midY = height / 2
-                        var isFirstPoint = true
-
-                        for (index, value) in history.enumerated() {
-                            let x = CGFloat(index) * width / CGFloat(max(history.count - 1, 1)) // ✅ Prevent division by zero
-                            let y = midY - height / 2 * value
-
-                            guard x.isFinite, y.isFinite else {
-                                print("Skipping invalid RMS point: x=\(x), y=\(y)")
-                                isFirstPoint = true
-                                continue
-                            }
-
-                            if isFirstPoint {
-                                path.move(to: CGPoint(x: x, y: y))
-                                isFirstPoint = false
-                            } else {
-                                path.addLine(to: CGPoint(x: x, y: y))
-                            }
-                        }
-                    }
-                    .stroke(Color.red, lineWidth: 2.0)
-                    .frame(height: geometry.size.height / 8)
-                }
-
-                // 1-Second RMS Graph
-                VStack {
-                    Text("1000 sample RMS")
-                        .font(.headline)
-                        .foregroundColor(.green)
-
-                    Path { path in
-                        let height = geometry.size.height / 12
-                        let width = geometry.size.width
-                        let history = graph.oneSecondRMSHistory.filter { $0.isFinite }
-
-                        guard history.count > 1 else { return }
-
-                        let midY = height / 2
-                        var isFirstPoint = true
-
-                        for (index, value) in history.enumerated() {
-                            let x = CGFloat(index) * width / CGFloat(max(history.count - 1, 1)) // ✅ Prevent division by zero
-                            let y = midY - height / 2 * value
-
-                            guard x.isFinite, y.isFinite else {
-                                print("Skipping invalid 1-sec RMS point: x=\(x), y=\(y)")
-                                isFirstPoint = true
-                                continue
-                            }
-
-                            if isFirstPoint {
-                                path.move(to: CGPoint(x: x, y: y))
-                                isFirstPoint = false
-                            } else {
-                                path.addLine(to: CGPoint(x: x, y: y))
-                            }
-                        }
-                    }
-                    .stroke(Color.green, lineWidth: 2.0)
-                    .frame(height: geometry.size.height / 12)
-                }
-                .padding(.top, 10)
-
-                if !BLE.isConnected {
-                    VStack {
-                        Text("Connect to Sensor")
-                            .font(.headline)
-
-                        List(BLE.BLEPeripherals) { peripheral in
-                            HStack {
-                                Text(peripheral.name).onTapGesture {
-                                    BLE.connectSensor(p: peripheral)
+                    
+                    // Fixed so works also for older verions of ios
+                    if #available(iOS 17.0, *) {
+                        Text("iOS 17+ Mode Active")
+                            .onChange(of: emgGraph.values) { oldValue, newValue in
+                                DispatchQueue.global(qos: .background).async {
+                                    print("🔄 UI Refresh (onChange): \(newValue.count) points in view.")
                                 }
-                                Spacer()
-                                Text("\(peripheral.rssi)")
+                                DispatchQueue.main.async {
+                                    emgGraph.objectWillChange.send()
+                                }
                             }
-                        }
-                        .frame(height: geometry.size.height / 10)
-                    }
-                } else {
-                    Text("Connected to EMGBLE2!")
-                        .font(.headline)
-                        .foregroundColor(.green)
-                }
-
-                VStack {
-                    Text("STATUS")
-                        .font(.headline)
-                    if BLE.BLEisOn {
-                        Text("Bluetooth is switched on")
-                            .foregroundColor(.green)
                     } else {
-                        Text("Bluetooth is NOT switched on")
-                            .foregroundColor(.red)
-                    }
-                }
-
-                HStack {
-                    VStack(spacing: 5) {
-                        Button("Start Scanning") { BLE.startScanning() }
-                            .disabled(BLE.isConnected)
-
-                        Button("Stop Scanning") { BLE.stopScanning() }
-                            .disabled(!BLE.BLEisOn || BLE.isConnected)
-                    }
-                    .padding()
-
-                    Spacer()
-
-                    VStack(spacing: 5) {
-                        Button("Start Recording") {
-                            DispatchQueue.global(qos: .background).async {
-                                graph.record()
-                                DispatchQueue.main.async {
-                                    print("Recording started.")
+                        Text("iOS 16 or earlier Mode")
+                            .onChange(of: emgGraph.values) { newValue in
+                                DispatchQueue.global(qos: .background).async {
+                                    print("🔄 UI Refresh (onChange): \(newValue.count) points in view.")
                                 }
+                                DispatchQueue.main.async {
+                                    emgGraph.objectWillChange.send()
+                                }
+                            }
+                    }
+                    
+                    // ✅ The Canvas should be OUTSIDE the `if` block to ensure it always renders
+                    Canvas { context, size in
+                        let smoothedValues = smoothData(values: emgGraph.values, windowSize: 5)
+                        let height = size.height
+                        let width = size.width
+                        let midY = height / 2
+                        
+                        guard !smoothedValues.isEmpty,
+                              !emgGraph.timestamps.isEmpty,
+                              smoothedValues.count == emgGraph.timestamps.count else {
+                            return
+                        }
+
+                        let firstSample = max(0, emgGraph.timestamps.count - 300)
+                        let visibleTimestamps = Array(emgGraph.timestamps[firstSample..<emgGraph.timestamps.count])
+                        let visibleValues = Array(smoothedValues[firstSample..<smoothedValues.count])
+
+                        guard let minTime = visibleTimestamps.first,
+                              let maxTime = visibleTimestamps.last,
+                              maxTime > minTime else {
+                            print("⚠️ Skipping Canvas draw: Invalid timestamps.")
+                            return
+                        }
+
+                        let timeRange = maxTime - minTime
+                        var path = Path()
+
+                        for (index, value) in visibleValues.enumerated() {
+                            let time = visibleTimestamps[index]
+                            let x = ((time - minTime) / timeRange) * width
+                            let y = midY - (height / 2 * value)
+
+                            if index == 0 {
+                                path.move(to: CGPoint(x: x, y: y))
+                            } else {
+                                path.addLine(to: CGPoint(x: x, y: y))
                             }
                         }
 
-                        Button("Stop Recording") {
-                            DispatchQueue.global(qos: .background).async {
-                                let fileContent = graph.stop_recording_and_save()
-                                DispatchQueue.main.async {
-                                    file_content.text = fileContent
-                                    print("Recording stopped and saved.")
+                        context.stroke(path, with: .color(.blue), lineWidth: 1.5)
+                    }
+                    .frame(height: geometry.size.height / 8)
+                }
+                    
+                    // 1000 Sample RMS Graph
+                    VStack {
+                        Text("1000 sample RMS")
+                            .font(.headline)
+                            .foregroundColor(.green)
+                        Canvas { context, size in
+                            let height = size.height
+                            let width = size.width
+                            let midY = height / 2
+                            let history = emgGraph.oneSecondRMSHistory.filter { $0.isFinite }
+                            
+                            guard history.count > 1 else { return }
+                            let firstSample = max(0, emgGraph.timestamps.count - history.count)
+                            let visibleTimestamps = Array(emgGraph.timestamps[firstSample..<emgGraph.timestamps.count])
+                            
+                            guard let minTime = visibleTimestamps.first,
+                                  let maxTime = visibleTimestamps.last,
+                                  maxTime > minTime else { return }
+                            
+                            let timeRange = maxTime - minTime
+                            var path = Path()
+                            
+                            for (index, value) in history.enumerated() {
+                                let time = visibleTimestamps[index]
+                                let x = ((time - minTime) / timeRange) * width
+                                let y = midY - (height / 2 * value)
+                                
+                                if index == 0 {
+                                    path.move(to: CGPoint(x: x, y: y))
+                                } else {
+                                    path.addLine(to: CGPoint(x: x, y: y))
                                 }
                             }
+                            
+                            context.stroke(path, with: .color(.green), lineWidth: 2.0)
                         }
-
-                        Button("Export last") { showingExporter = true }
+                        .frame(height: geometry.size.height / 12)
+                        
                     }
-                    .padding()
+                    .padding(.top, 10)
+                    
+                    // BLE Status and Connection
+                    if !bleManager.isConnected {
+                        VStack {
+                            Text("Connect to Sensor")
+                                .font(.headline)
+                            List(bleManager.BLEPeripherals) { peripheral in
+                                HStack {
+                                    Text(peripheral.name).onTapGesture {
+                                        bleManager.connectSensor(p: peripheral)
+                                    }
+                                    Spacer()
+                                    Text("\(peripheral.rssi)")
+                                }
+                            }
+                            .frame(height: geometry.size.height / 10)
+                        }
+                    } else {
+                        Text("Connected to EMGBLE2!")
+                            .font(.headline)
+                            .foregroundColor(.green)
+                    }
+                    
+                    // Bluetooth Status
+                    VStack {
+                        Text("STATUS")
+                            .font(.headline)
+                        if bleManager.BLEisOn {
+                            Text("Bluetooth is switched on")
+                                .foregroundColor(.green)
+                        } else {
+                            Text("Bluetooth is NOT switched on")
+                                .foregroundColor(.red)
+                        }
+                        //  display the reconnection attempts
+                        if bleManager.reconnectionAttempts > 0 {
+                            Text("Reconnection Attempts: \(bleManager.reconnectionAttempts)/\(bleManager.maxReconnectionAttempts)")
+                                .foregroundColor(bleManager.reconnectionAttempts >= bleManager.maxReconnectionAttempts ? .red : .orange) // Amber color for attempts
+                                .font(.subheadline)
+                        }
+                    }
+                    
+                    // Controls
+                    HStack {
+                        VStack(spacing: 5) {
+                            Button("Start Scanning") { bleManager.startScanning() }
+                                .disabled(bleManager.isConnected)
+                            
+                            Button("Stop Scanning") { bleManager.stopScanning() }
+                                .disabled(!bleManager.BLEisOn || bleManager.isConnected)
+                            
+                            Button("Reconnect Sensor") {
+                                if let firstPeripheral = bleManager.BLEPeripherals.first {
+                                    print("🔄 Manual reconnection initiated...")
+                                    bleManager.reconnectionAttempts = 0 // Reset attempts
+                                    bleManager.connectSensor(p: firstPeripheral)  // Start the connection attempt
+                                } else {
+                                    print("⚠️ No known sensors available for reconnection.")
+                                    bleManager.startScanning()  // Restart scanning if no peripherals are found
+                                }
+                            }
+                            .disabled(bleManager.isConnected)
+                            .padding()
+                            .background(bleManager.isConnected ? Color.gray : Color.blue)
+                            .foregroundColor(.white)
+                            .cornerRadius(10)
+                            
+                        }
+                        .padding()
+                        
+                        Spacer()
+                        
+                        VStack(spacing: 5) {
+                            Button("Start Recording") {
+                                DispatchQueue.global(qos: .background).async {
+                                    emgGraph.record()
+                                    DispatchQueue.main.async {
+                                        print("Recording started.")
+                                    }
+                                }
+                            }
+                            
+                            Button("Stop Recording") {
+                                DispatchQueue.global(qos: .background).async {
+                                    print("🔹 Stop Recording button pressed. Stopping recording...")
+                                    let fileContent = emgGraph.stop_recording_and_save()
+                                    DispatchQueue.main.async {
+                                        file_content.text = fileContent
+                                        print("Recording stopped and saved.")
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                            showingExporter = true
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            Button("Export last") {
+                                guard !isExporting else {
+                                    print("⚠️ Export already in progress.")
+                                    return
+                                }
+                                isExporting = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                                    isExporting = false
+                                }
+                                
+                                if file_content.text.isEmpty {
+                                    print("⚠️ No data available to export.")
+                                } else {
+                                    print("🔹 Preparing to export file...")
+                                    showingExporter = true
+                                }
+                                isExporting = false
+                            }
+                        }
+                        .padding()
+                    }
+                    
+                    HStack {
+                        Button("Reset Graphs") {
+                            emgGraph.resetGraph()
+                            
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                emgGraph.objectWillChange.send()
+                            }
+                            
+                            // ✅ Add multiple placeholder values to force a refresh
+                            let fakeTimestamp = CACurrentMediaTime()
+                            print("🔄 Manually adding BLE data points after reset.")
+                            for i in 0..<15 { // Add a few points to force the graph to refresh
+                                let offsetTimestamp = fakeTimestamp + (Double(i) * 0.1)
+                                bleManager.processAndAppendEMGData([0.02], timestamp: offsetTimestamp)
+                            }
+                            // ✅ Confirm BLE data was appended
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                emgGraph.objectWillChange.send()
+                                print("🔄 UI Refresh forced after reset.") // Debugging
+                            }
+                            
+                        }
+                        .foregroundColor(.red)
+                        
+                        Spacer()
+                        
+                        Button("Refresh Graphs") {
+                            emgGraph.objectWillChange.send()
+                        }
+                        .foregroundColor(.blue)
+                    }
                 }
-
-                HStack {
-                    Button("Reset Graphs") {
-                        graph.values.removeAll()
-                        graph.oneSecondRMSHistory.removeAll()
-                        graph.shortTermRMSHistory.removeAll()
-                        graph.max10SecRMSHistory.removeAll()
+                .padding(10)
+                
+                .fileExporter(
+                    isPresented: $showingExporter,
+                    document: file_content,
+                    contentType: .commaSeparatedText,
+                    defaultFilename: "emg-data"
+                ) { result in
+                    DispatchQueue.main.async {
+                        switch result {
+                        case .success(let url):
+                            print("✅ File successfully saved to: \(url)")
+                            showingExporter = false
+                        case .failure(let error):
+                            print("❌ Failed to save file: \(error.localizedDescription)")
+                            showingExporter = false
+                        }
                     }
-                    .foregroundColor(.red)
-
-                    Spacer()
-
-                    Button("Refresh Graphs") {
-                        graph.objectWillChange.send()
-                    }
-                    .foregroundColor(.blue)
                 }
-            }
-            .padding(10)
-            .fileExporter(isPresented: $showingExporter, document: file_content, contentType: .commaSeparatedText, defaultFilename: "emg-data") { result in
-                switch result {
-                case .success(let url):
-                    print("Saved to \(url)")
-                case .failure(let error):
-                    print(error.localizedDescription)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .alert(isPresented: $bleManager.showAlert) {
+                    Alert(title: Text("Connection Error"), message: Text(bleManager.alertMessage), dismissButton: .default(Text("OK")))
                 }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-struct TextFile: FileDocument {
-    static var readableContentTypes = [UTType.commaSeparatedText]
-    static var preferredFilenameExtension: String? { "csv" }
-    var text = ""
-
-    init(initialText: String = "") {
-        text = initialText
     }
 
-    init(configuration: ReadConfiguration) throws {
-        if let data = configuration.file.regularFileContents {
-            text = String(decoding: data, as: UTF8.self)
-        }
-    }
-
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
-        let data = Data(text.utf8)
-        return FileWrapper(regularFileWithContents: data)
-    }
-}
 
