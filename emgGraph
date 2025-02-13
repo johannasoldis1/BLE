@@ -12,6 +12,8 @@ class emgGraph: ObservableObject {
     var recorded_rms: [CGFloat] = [] // 1-second RMS values for export
     var shortTermRMSValues: [Float] = [] // Short-term RMS values for export
     var timestamps: [CFTimeInterval] = [] // Timestamps for each recorded value
+    var recording_duration: CFTimeInterval = 0 // To store the recording duration
+    
     
     var recording: Bool = false // Recording state
     var start_time: CFTimeInterval = 0 // Start time for recording
@@ -23,34 +25,68 @@ class emgGraph: ObservableObject {
     private let oneSecondRMSWindowSize = 100 // 100 samples for 10 seconds (10 Hz)
     
     private var longTermRMSBuffer: [CGFloat] = [] // Buffer for 10-second max RMS calculation
-    private let longTermRMSWindowSize = 10 // 10 x 1-second RMS values
+    private let longTermRMSWindowSize = 20 // 20 x 1-second RMS values
     
     private var shortTermSampleCounter = 0 // Counter for 0.1-second RMS updates
     var droppedPacketTimestamps: [CFTimeInterval] = [] // Stores timestamps of dropped packets
+    
+    // Set maximum buffer size
+    private let maxBufferSize = 5000
+    
+    
+    //prevent lag in UI at high frequencies, throttle UI update with timer of 100ms
+    private var lastUIUpdateTime: CFTimeInterval = 0
+    private let uiUpdateInterval: CFTimeInterval = 0.5 // Update every 100ms
     
     init(firstValues: [CGFloat]) {
         values = firstValues
     }
     
     func record() {
-        recording = true
-        start_time = CACurrentMediaTime()
-        recorded_values.removeAll()
-        recorded_rms.removeAll()
-        shortTermRMSValues.removeAll()
-        max10SecRMSHistory.removeAll()
-        timestamps.removeAll()
-        shortTermRMSBuffer.removeAll()
-        oneSecondRMSBuffer.removeAll()
-        longTermRMSBuffer.removeAll()
-        shortTermSampleCounter = 0 // Reset counter when recording starts
+        print("Recorded values before clearing: \(recorded_values.count)")
+        print("Timestamps before clearing: \(timestamps.count)")
+        print("Short-term RMS before clearing: \(shortTermRMSValues.count)")
+        
+        // ✅ Prevent multiple resets
+        if recording {
+            print("✅ Recording is already active. No action needed.")
+            return
+        }
+        
+        DispatchQueue.main.async { [weak self] in
+            self?.max10SecRMSHistory.removeAll()
+            print("🔴 Starting Recording... Current emgGraph instance: \(String(describing: self))")
+            self?.recording = true
+            self?.start_time = CACurrentMediaTime()
+            print("✅ Recording started successfully. Recording flag: \(String(describing: self?.recording))")
+        }
+        
+        // ✅ Only clear buffers for first-time recording
+        if recorded_values.isEmpty {
+            print("✅ First-time recording. Clearing buffers now.")
+            recorded_values.removeAll()
+            recorded_rms.removeAll()
+            shortTermRMSValues.removeAll()
+            timestamps.removeAll()
+            shortTermRMSBuffer.removeAll()
+            oneSecondRMSBuffer.removeAll()
+            longTermRMSBuffer.removeAll()
+            shortTermSampleCounter = 0
+        } else {
+            print("⚠️ Buffers already contain data. Not clearing them.")
+        }
     }
     
+    
     func stop_recording_and_save() -> String {
+        // Stop recording
+        print("🔹 Stopping recording and preparing data for export...")
         recording = false
         let stop_time = CACurrentMediaTime()
-        let recording_duration = stop_time - start_time
+        recording_duration = stop_time - start_time // Store the duration
+        print("Recording stopped. Duration: \(recording_duration) seconds")
         
+        // Append any remaining short-term and one-second RMS values
         DispatchQueue.main.async {
             if !self.shortTermRMSBuffer.isEmpty {
                 let remainingShortTermRMS = self.calculateRMS(from: self.shortTermRMSBuffer.map { Float($0) }) // Convert to Float
@@ -63,50 +99,165 @@ class emgGraph: ObservableObject {
             }
         }
         
-        var dataset = "Recording Duration (s):,\(recording_duration)\n"
-        dataset += "Sample,System Timestamp (s),EMG (Raw Data),0.1s RMS,1s RMS\n"
+        // Debugging the recorded data
+        print("Recorded Values Count: \(recorded_values.count)")
+        print("Timestamps Count: \(timestamps.count)")
         
+        // Start preparing the dataset
+        var dataset = "Recording Duration (s):,\(recording_duration)\n"
+        dataset += "Index,System Timestamp (s),EMG (Raw Data),0.1s RMS,1s RMS\n" // Column headers
+        
+        // ✅ Prevent duplicate timestamps and filter NaN values
+        var seenTimestamps: Set<CFTimeInterval> = []
+        
+        // Iterate through recorded values to construct the dataset
         for (index, rawValue) in recorded_values.enumerated() {
             let systemTimestamp = timestamps.indices.contains(index) ? timestamps[index] : 0.0
+            
+            // ✅ Skip duplicate timestamps
+            if seenTimestamps.contains(systemTimestamp) {
+                continue
+            }
+            seenTimestamps.insert(systemTimestamp)
+            
             var shortTermRMS: Float = 0.0
             var oneSecondRMS: Float = 0.0
             
-            // Calculate RMS for the relevant intervals
+            // Retrieve short-term RMS
             if index % self.shortTermRMSWindowSize == 0 && index / self.shortTermRMSWindowSize < self.shortTermRMSValues.count {
                 shortTermRMS = self.shortTermRMSValues[index / self.shortTermRMSWindowSize]
             }
             
+            // Retrieve one-second RMS
             if index % self.oneSecondRMSWindowSize == 0 && index / self.oneSecondRMSWindowSize < self.recorded_rms.count {
                 oneSecondRMS = Float(self.recorded_rms[index / self.oneSecondRMSWindowSize]) // Convert CGFloat to Float
             }
             
-            // Replace NaN with 0.0
-            let emgData = rawValue.isNaN ? "0.0" : "\(rawValue)"
-            let rmsShortTerm = shortTermRMS.isNaN ? "0.0" : "\(shortTermRMS)"
-            let rmsOneSecond = oneSecondRMS.isNaN ? "0.0" : "\(oneSecondRMS)"
+            // Debug each row
+            print("Row \(index): Timestamp \(systemTimestamp), Raw EMG \(rawValue), Short-Term RMS \(shortTermRMS), One-Second RMS \(oneSecondRMS)")
             
+            // ✅ Replace NaN or invalid values with 0.0 for safety
+            let emgData = rawValue.isNaN ? "0.0" : String(format: "%.6f", rawValue) // Format to 6 decimal places
+            let rmsShortTerm = shortTermRMS.isNaN ? "0.0" : String(format: "%.6f", shortTermRMS)
+            let rmsOneSecond = oneSecondRMS.isNaN ? "0.0" : String(format: "%.6f", oneSecondRMS)
+            
+            // Append row to the dataset
             dataset += "\(index),\(systemTimestamp),\(emgData),\(rmsShortTerm),\(rmsOneSecond)\n"
         }
         
+        // Save the dataset to a file
         saveToFile(dataset)
         return dataset
     }
     
+    func resetGraph() {
+        DispatchQueue.main.async {
+            self.values.removeAll()
+            self.timestamps.removeAll()
+            self.oneSecondRMSHistory.removeAll()
+            self.shortTermRMSHistory.removeAll()
+            self.max10SecRMSHistory.removeAll()
+            self.recorded_values.removeAll()
+            self.recorded_rms.removeAll()
+            self.shortTermRMSValues.removeAll()
+            self.shortTermRMSBuffer.removeAll()
+            self.oneSecondRMSBuffer.removeAll()
+            self.longTermRMSBuffer.removeAll()
+            self.shortTermSampleCounter = 0
+            print("✅ Reset completed - added placeholder values to avoid empty graph.")
+            // ✅ Print to check if values exist
+            print("🔍 Graph values count after reset: \(self.values.count)")
+            print("🔍 Graph timestamps count after reset: \(self.timestamps.count)")
+            
+            // ✅ Add placeholder values to prevent empty graph
+            self.values.append(contentsOf: Array(repeating: 0.001, count: 50))
+            self.oneSecondRMSHistory.append(contentsOf: [0.0, 0.001])
+            self.shortTermRMSHistory.append(contentsOf: [0.0, 0.001])
+            self.max10SecRMSHistory.append(contentsOf: [0.0, 0.001])
+            
+            print("✅ Reset completed - added placeholder values to avoid empty graph.")
+            
+            // ✅ Force UI update
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                self.objectWillChange.send()
+                
+                
+            }
+        }
+    }
+    
     private func saveToFile(_ dataset: String) {
         DispatchQueue.global(qos: .background).async {
-            let paths = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
-            let date = Date()
+            guard !dataset.isEmpty else {
+                print("❌ Dataset is empty. File saving aborted.")
+                return
+            }
+            
+            let fileManager = FileManager.default
+            let documentDirectory = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first
             let dateFormatter = DateFormatter()
             dateFormatter.dateFormat = "yyyy-MM-dd'T'HH_mm_ss"
             
-            let filename = paths[0].appendingPathComponent("emg_data_" + dateFormatter.string(from: date) + ".csv")
+            guard let directory = documentDirectory else {
+                print("❌ Unable to access the document directory.")
+                return
+            }
+            
+            let filename = directory.appendingPathComponent("emg_data_\(dateFormatter.string(from: Date())).csv")
+            
             do {
                 try dataset.write(to: filename, atomically: true, encoding: .utf8)
-                print("File saved successfully")
+                DispatchQueue.main.async {
+                    print("✅ File saved successfully at: \(filename.path)")
+                }
             } catch {
-                print("Failed to write file: \(error.localizedDescription)")
+                DispatchQueue.main.async {
+                    print("❌ Failed to save file: \(error.localizedDescription)")
+                }
             }
         }
+    }
+    
+    private func prepareAndSaveToFile() {
+        // Validate that we have data to save
+        guard !recorded_values.isEmpty, !timestamps.isEmpty else {
+            print("❌ No recorded values or timestamps to save.")
+            return
+        }
+        
+        // Start preparing the dataset
+        var dataset = "Recording Duration (s):,\(recording_duration)\n"
+        dataset += "Index,System Timestamp (s),EMG (Raw Data),0.1s RMS,1s RMS\n" // Column headers
+        
+        // Iterate through recorded values and build the CSV data
+        for (index, rawValue) in recorded_values.enumerated() {
+            let systemTimestamp = timestamps.indices.contains(index) ? timestamps[index] : 0.0
+            let shortTermRMS = index / shortTermRMSWindowSize < shortTermRMSValues.count
+            ? shortTermRMSValues[index / shortTermRMSWindowSize]
+            : 0.0
+            let oneSecondRMS = index / oneSecondRMSWindowSize < recorded_rms.count
+            ? recorded_rms[index / oneSecondRMSWindowSize]
+            : 0.0
+            
+            // Append a row to the dataset
+            dataset += "\(index),\(systemTimestamp),\(rawValue),\(shortTermRMS),\(oneSecondRMS)\n"
+        }
+        
+        // Log dataset preview for debugging
+        print("🔍 Dataset Preview:\n\(dataset.prefix(500))") // First 500 characters of the dataset
+        
+        // Call saveToFile with the prepared dataset
+        saveToFile(dataset)
+    }
+    
+    func triggerDataSaving() {
+        print("📁 Preparing to save EMG data to a file...")
+        prepareAndSaveToFile()
+    }
+    
+    func normalizeTimestamp(_ timestamp: CFTimeInterval, precision: Int = 1) -> CFTimeInterval {
+        let multiplier = pow(10.0, Double(precision))
+        return round(timestamp * multiplier) / multiplier
     }
     
     func updateMax10SecRMS(_ oneSecondRMS: CGFloat) {
@@ -139,80 +290,163 @@ class emgGraph: ObservableObject {
     }
     
     func append(values: [CGFloat], timestamp: CFTimeInterval) {
-        if recording {
-            for value in values {
-                // Ensure timestamp is valid (not NaN)
-                if !timestamp.isFinite {
-                    print("WARNING: Invalid timestamp detected. Skipping this entry.")
-                    continue
-                }
-                
-                // Handle missing timestamps & track packet loss
-                if let lastTimestamp = timestamps.last {
-                    while lastTimestamp + 0.1 < timestamp {
-                        print("Filling missing timestamp: \(lastTimestamp + 0.1) (NaN replaced with 0.0)")
-                        recorded_values.append(0.0) // Replace NaN with 0.0
-                        timestamps.append(lastTimestamp + 0.1)
-                        droppedPacketTimestamps.append(lastTimestamp + 0.1)
-                    }
-                }
-                
-                let sanitizedValue = value.isFinite ? value : 0.0 // ✅ Ensure only valid CGFloat values
-                
-                recorded_values.append(sanitizedValue)
-                timestamps.append(timestamp)
-                
-                if value.isNaN {
-                    print("WARNING: NaN detected at timestamp \(timestamp), storing as a dropped packet.")
-                    droppedPacketTimestamps.append(timestamp)
-                    continue
-                }
-                
-                shortTermRMSBuffer.append(sanitizedValue)
-                shortTermSampleCounter += 1
-                oneSecondRMSBuffer.append(sanitizedValue)
-                
-                if shortTermSampleCounter >= shortTermRMSWindowSize {
-                    let shortTermRMS = calculateRMS(from: shortTermRMSBuffer.map { Float($0) })
-                    let validShortTermRMS = shortTermRMS.isFinite ? shortTermRMS : 0.0
-                    DispatchQueue.main.async {
-                        self.shortTermRMSValues.append(validShortTermRMS)
-                        self.shortTermRMSHistory.append(CGFloat(validShortTermRMS))
-                    }
+        print("🔄 append(values: \(values), timestamp: \(timestamp)) called") // Debug log
+        
+        // ✅ Ensure new data is received before proceeding
+        guard !values.isEmpty else {
+            print("⚠️ No new data received. Skipping UI update.")
+            return
+        }
+        
+        // ✅ Auto-start recording if it was inactive
+        if !recording {
+            print("⚠️ Recording was not active. Starting now...")
+            record() // Auto-start recording when new data arrives.
+        }
+        
+        // ✅ Ensure recording is active before appending
+        guard recording else {
+            print("⚠️ Recording is not active. Data is not being appended.")
+            return
+        }
+        
+        // ✅ Ensure valid timestamp
+        guard timestamp.isFinite else {
+            print("❌ Invalid timestamp detected: \(timestamp). Skipping this entry.")
+            return
+        }
+        
+        // ✅ **Fix: Ensure Values & Timestamps Stay in Sync**
+        if timestamps.count > recorded_values.count {
+            print("⚠️ Timestamps count (\(timestamps.count)) exceeds values count (\(recorded_values.count))! Adjusting...")
+            timestamps.removeFirst(timestamps.count - recorded_values.count)
+        }
+        
+        if recorded_values.count > timestamps.count {
+            print("⚠️ Values count (\(recorded_values.count)) exceeds timestamps count (\(timestamps.count))! Adjusting...")
+            recorded_values.removeFirst(recorded_values.count - timestamps.count)
+        }
+        
+        // ✅ Handle missing timestamps and packet loss
+        if let lastTimestamp = timestamps.last, let lastValue = recorded_values.last {
+            var normalizedLastTimestamp = normalizeTimestamp(lastTimestamp)
+            let normalizedCurrentTimestamp = normalizeTimestamp(timestamp)
+            
+            let maxAllowedGap: CFTimeInterval = 0.2 // Normal max gap for small gaps
+            let maxGapThreshold: CFTimeInterval = 3.0 // If gap >3s, avoid excessive interpolation
+            
+            if normalizedCurrentTimestamp - normalizedLastTimestamp > maxGapThreshold {
+                print("⚠️ Large gap detected (>3s), skipping interpolation to prevent unrealistic values.")
+                normalizedLastTimestamp = normalizedCurrentTimestamp // Reset to avoid flooding
+            } else {
+                while normalizedLastTimestamp + maxAllowedGap < normalizedCurrentTimestamp {
+                    let missingTimestamp = normalizeTimestamp(normalizedLastTimestamp + 0.1)
                     
-                    shortTermRMSBuffer.removeAll()
-                    shortTermSampleCounter = 0
-                }
-                
-                if oneSecondRMSBuffer.count == oneSecondRMSWindowSize {
-                    let oneSecondRMS = calculateRMS(from: oneSecondRMSBuffer.map { Float($0) })
-                    let validOneSecondRMS = oneSecondRMS.isFinite ? oneSecondRMS : 0.0
-                    DispatchQueue.main.async {
-                        self.oneSecondRMSHistory.append(CGFloat(validOneSecondRMS))
-                        self.recorded_rms.append(CGFloat(validOneSecondRMS))
-                    }
+                    // ✅ Fill in missing data with last known value instead of averaging
+                    recorded_values.append(lastValue)
+                    timestamps.append(missingTimestamp)
+                    droppedPacketTimestamps.append(missingTimestamp)
                     
-                    updateMax10SecRMS(CGFloat(validOneSecondRMS))
-                    oneSecondRMSBuffer.removeAll()
+                    print("⚠️ Small gap detected. Interpolating missing timestamp \(missingTimestamp) with value \(lastValue).")
+                    
+                    normalizedLastTimestamp += 0.1
                 }
             }
         }
         
-        DispatchQueue.main.async {
-            self.objectWillChange.send()
-            
-            let filteredValues = values.filter { $0.isFinite } // ✅ Remove NaN before UI update
-            
-            if !filteredValues.isEmpty {
-                self.values.append(contentsOf: filteredValues)
-            } else {
-                print("WARNING: All values were NaN, skipping raw EMG graph update.")
+        // Append new values and timestamps
+        for value in values {
+            // ✅ Detect suspiciously constant EMG values (sensor issue)
+            if recorded_values.count > 10 { // Ensure enough data points for comparison
+                let lastTenValues = recorded_values.suffix(10)
+                let maxDiff = lastTenValues.max()! - lastTenValues.min()!
+                
+                if maxDiff < 0.0001 { // If EMG signal variation is too small
+                    print("⚠️ Warning: Minimal signal variation detected at timestamp \(timestamp). Possible sensor issue?")
+                }
             }
             
-            if self.values.count > 1000 {
-                self.values.removeFirst(self.values.count - 1000)
-                self.timestamps.removeFirst(self.timestamps.count - 1000)
+            // ✅ Sanitize and store the value
+            let sanitizedValue = value.isFinite ? value : 0.0 // Replace NaN with 0.0
+            recorded_values.append(sanitizedValue)
+            timestamps.append(timestamp)
+            print("✅ Appended value: \(sanitizedValue), timestamp: \(timestamp)") // Debug log
+            
+            if value.isNaN {
+                print("⚠️ NaN detected at timestamp \(timestamp). Marked as dropped packet.")
+                droppedPacketTimestamps.append(timestamp)
+            }
+            
+            // ✅ Update RMS buffers
+            shortTermRMSBuffer.append(sanitizedValue)
+            shortTermSampleCounter += 1
+            oneSecondRMSBuffer.append(sanitizedValue)
+        }
+        
+        // ✅ Calculate short-term RMS (every 10 samples)
+        if shortTermSampleCounter >= shortTermRMSWindowSize {
+            DispatchQueue.global(qos: .background).async {
+                let shortTermRMS = self.calculateRMS(from: self.shortTermRMSBuffer.map { Float($0) })
+                DispatchQueue.main.async {
+                    self.shortTermRMSValues.append(shortTermRMS)
+                    self.shortTermRMSHistory.append(CGFloat(shortTermRMS))
+                    print("📏 Short-Term RMS Count: \(self.shortTermRMSHistory.count)")
+                }
+                self.shortTermRMSBuffer.removeAll()
+            }
+            shortTermSampleCounter = 0
+        }
+        
+        // ✅ Calculate one-second RMS (every 100 samples)
+        if oneSecondRMSBuffer.count == oneSecondRMSWindowSize {
+            let oneSecondRMS = calculateRMS(from: oneSecondRMSBuffer.map { Float($0) })
+            let validOneSecondRMS = oneSecondRMS.isFinite ? oneSecondRMS : 0.0
+            
+            DispatchQueue.main.async {
+                self.oneSecondRMSHistory.append(CGFloat(validOneSecondRMS))
+                self.recorded_rms.append(CGFloat(validOneSecondRMS))
+                print("📏 One-Second RMS Count: \(self.oneSecondRMSHistory.count)")
+                print("🔹 Last One-Second RMS Value: \(validOneSecondRMS)")
+            }
+            
+            updateMax10SecRMS(CGFloat(validOneSecondRMS))
+            oneSecondRMSBuffer.removeAll()
+        }
+        
+        // ✅ Debugging: Confirm latest timestamp and sample count
+        print("🕒 Latest Timestamp: \(timestamps.last ?? -1), Total Samples: \(timestamps.count)")
+        
+        // ✅ **Force UI Update only when values & timestamps are both valid**
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            
+            let now = CACurrentMediaTime()
+            
+            // ✅ Prevent unnecessary UI updates if there’s no new data
+            guard !values.isEmpty else {
+                print("⚠️ No new values added, skipping UI refresh.")
+                return
+            }
+            
+            // Throttle UI updates to avoid blinking (adding throttle check)
+            if now - self.lastUIUpdateTime >= self.uiUpdateInterval {
+                self.lastUIUpdateTime = now
+                self.objectWillChange.send() // Trigger UI update after interval
+            }
+            
+            // ✅ Append values efficiently
+            self.values.append(contentsOf: values.filter { $0.isFinite })
+            
+            // ✅ Prevent buffer overflow
+            let bufferLimit = min(maxBufferSize, 1000)
+            if self.values.count > bufferLimit {
+                // Instead of dropping 20%, you could try a smaller percentage, or you could drop the oldest samples.
+                let dropCount = self.values.count - (bufferLimit * 90 / 100) // Keep 90% of recent data
+                self.values.removeFirst(dropCount)
+                self.timestamps.removeFirst(dropCount)
+                self.recorded_values.removeFirst(dropCount)
             }
         }
     }
 }
+        
