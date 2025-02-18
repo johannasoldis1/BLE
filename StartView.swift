@@ -5,7 +5,6 @@
 //  Created by Jóhanna Sóldís Hyström on 18.2.2025.
 //
 
-
 import SwiftUI
 
 struct StartView: View {
@@ -16,17 +15,17 @@ struct StartView: View {
         VStack {
             // App Header (Logo + Name)
             HStack {
-                Image("HandWaveLogo") // Replace with the exact asset name
+                Image("HandWaveLogo") // Ensure this matches your asset name in Xcode
                     .resizable()
                     .scaledToFit()
-                    .frame(width: 40, height: 40) // Adjust as needed
-                    .clipShape(Circle()) // Makes it circular
+                    .frame(width: 40, height: 40) // Adjust size if needed
+                    .clipShape(Circle()) // Ensures a circular logo
                 
                 Text("Hand Wave")
                     .font(.title2)
                     .fontWeight(.bold)
                 
-                Spacer() // Pushes the content to the left
+                Spacer() // Pushes content to the left
             }
             .padding(.horizontal)
             .padding(.top, 10) // Adjust top padding for spacing
@@ -36,51 +35,49 @@ struct StartView: View {
             // TabView Section
             TabView {
                 // Home Page with Instructions
-                VStack {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 15) {
-                            Text("How to Use the EMG Device")
-                                .font(.title2)
-                                .fontWeight(.bold)
-                                .padding(.bottom, 5)
-                            
-                            Text("**Step 1: Preparing the EMG Sensor**")
-                                .font(.headline)
-                            Text("""
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 15) {
+                        Text("How to Use the EMG Device")
+                            .font(.title2)
+                            .fontWeight(.bold)
+                            .padding(.bottom, 5)
+                        
+                        Text("**Step 1: Preparing the EMG Sensor**")
+                            .font(.headline)
+                        Text("""
                         1. **Clean the Skin:** Use alcohol wipes where the sensor will be placed for better contact.
                         2. **Attach the Sensor:** Place it on the muscle you want to measure.
                         """)
-                            
-                            Text("**Step 2: Connecting to the App**")
-                                .font(.headline)
-                            Text("""
+                        
+                        Text("**Step 2: Connecting to the App**")
+                            .font(.headline)
+                        Text("""
                         1. **Enable Bluetooth** on your phone.
                         2. **Open the App** – The home screen will appear.
-                        4. **Connect to the Sensor** in the 'Graph' tab.
+                        3. **Go to 'Graph' tab** and select your sensor to connect.
                         """)
-                            
-                            Text("**Step 3: Recording and Analyzing EMG Data**")
-                                .font(.headline)
-                            Text("""
+                        
+                        Text("**Step 3: Recording and Analyzing EMG Data**")
+                            .font(.headline)
+                        Text("""
                         1. **Go to 'Graph' Tab** to view real-time EMG signals.
                         2. **Start Recording** and perform your muscle activity.
                         3. **Stop and Save** when done, then export data as needed.
                         """)
-                            
-                            Text("**Step 4: Reviewing and Exporting Data**")
-                                .font(.headline)
-                            Text("""
+                        
+                        Text("**Step 4: Reviewing and Exporting Data**")
+                            .font(.headline)
+                        Text("""
                         - **View previous recordings** in the 'Data' tab.
                         - **Export data** in CSV format for further analysis.
                         """)
-                            
-                            // Button to navigate to the Graph UI (Existing ContentView)
-                            NavigationLink(destination: ContentView(emgGraph: emgGraph, bleManager: bleManager)) {
-                            }
-                            .padding(.top, 20)
+                        
+                        // Button to navigate to the Graph UI (Existing ContentView)
+                        NavigationLink(destination: ContentView(emgGraph: emgGraph, bleManager: bleManager)) {
                         }
-                        .padding()
+                        .padding(.top, 20)
                     }
+                    .padding()
                 }
                 .tabItem {
                     Image(systemName: "house")
@@ -94,19 +91,14 @@ struct StartView: View {
                         Text("Graph")
                     }
                 
-                // Data Tab (Placeholder for future use)
-                VStack {
-                    Text("Data View")
-                        .font(.largeTitle)
-                        .padding()
-                    Text("This is where data visualization will be added.")
-                }
-                .tabItem {
-                    Image(systemName: "doc.text")
-                    Text("Data")
-                }
+                // Data Tab - Calls the new DataView.swift
+                DataView()
+                    .tabItem {
+                        Image(systemName: "doc.text")
+                        Text("Data")
+                    }
             }
+            .background(Color.white) // Ensures no transparency issues
         }
     }
 }
-
