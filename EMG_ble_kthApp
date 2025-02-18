@@ -7,11 +7,12 @@ import SwiftUI
 @main
 struct EMGApp: App {
     var body: some Scene {
-        let emgGraphInstance = emgGraph(firstValues: [])
-        let bleManagerInstance = BLEManager(emg: emgGraphInstance)
-
         WindowGroup {
-            ContentView(emgGraph: emgGraphInstance, bleManager: bleManagerInstance)
+            let emgGraphInstance = emgGraph(firstValues: [])
+            let bleManagerInstance = BLEManager(emg: emgGraphInstance)
+
+            StartView(emgGraph: emgGraphInstance, bleManager: bleManagerInstance)
         }
     }
 }
+
