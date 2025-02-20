@@ -1,18 +1,23 @@
 //
 //  EMG_ble_kthApp.swift
 //  EMG-ble-kth
+//
 
 import SwiftUI
 
 @main
 struct EMGApp: App {
+    init() {
+        // ✅ Allow screen to turn off (Auto-Lock enabled)
+        UIApplication.shared.isIdleTimerDisabled = false
+    }
+
     var body: some Scene {
         WindowGroup {
             let emgGraphInstance = emgGraph(firstValues: [])
             let bleManagerInstance = BLEManager(emg: emgGraphInstance)
 
-            StartView(emgGraph: emgGraphInstance, bleManager: bleManagerInstance)
+            StartView(emgGraph: emgGraphInstance, bleManager: bleManagerInstance) // or ContentView if preferred
         }
     }
 }
-
