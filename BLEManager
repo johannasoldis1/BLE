@@ -7,6 +7,7 @@ import Foundation
 import CoreBluetooth
 import QuartzCore // for time
 import SwiftUI // Required for Alert
+import UIKit  // Required for background execution
 
 struct TimestampedData: Comparable {
     let timestamp: CFTimeInterval
@@ -100,7 +101,9 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
     @Published var BLEisOn = false
     @Published var BLEPeripherals = [Peripheral]()
     @Published var isConnected = false
-
+    
+    // Track when the last log was printed
+    private var lastSkippedLogTime: CFTimeInterval = CACurrentMediaTime()
     
     var CBPeripherals = [CBPeripheral]()
     var emgCharacteristic: CBCharacteristic?
@@ -108,29 +111,30 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
     private var droppedPackets: Int = 0
     private var totalPackets: Int = 0
     private let packetLossThreshold: Float = 0.1 // 10% packet loss threshold
-
+    
+    
     // RMS Buffers and Calculation
     private var emgBuffer: [Float] = [] // Buffer for 0.1-second RMS calculation
     private let windowSize = 1 // 0.1 seconds at 10 Hz sampling rate
     @Published var currentRMS: Float = 0.0 // Latest 0.1-second RMS
     @Published var rmsHistory: [Float] = [] // Store historical 0.1-second RMS values
-
+    
     private var oneSecondBuffer: [Float] = [] // Buffer for 1-second RMS calculation
     private let oneSecondWindowSize = 10 // 1 second at 10 Hz sampling rate
     @Published var oneSecondRMS: Float = 0.0 // Latest 1-second RMS
-
+    
     ///process BLE data in the background
     private let dataQueue = DispatchQueue(label: "com.emg.ble.data")
-
+    
     var notificationTimestamps: [CFTimeInterval] = [] // Stores timestamps for debugging
     var notificationSamples: [Int] = [] // Stores sample counts per notification
-
+    
     var firstSampleTimestamp: CFTimeInterval? // Stores first timestamp as reference
     var expectedNextTimestamp: CFTimeInterval? // Expected timestamp for next sample
-
+    
     private var receivedValuesPerTimestamp: [CFTimeInterval: [Float]] = [:] // Rolling buffer for tracking received values
-    private let rollingBufferLimit = 500 // Stores data for the last 10 seconds (assuming 10 Hz updates)
-
+    private let rollingBufferLimit = 700 // Stores data for the last 10 seconds (assuming 10 Hz updates)
+    
     var reconnectionAttempts: Int = 0
     let maxReconnectionAttempts = 2
     
@@ -142,37 +146,68 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
     private var lastSARUpdateTime: CFTimeInterval = CACurrentMediaTime()
     private var lastPrintTime: CFTimeInterval = CACurrentMediaTime()
     private var lastSARValue: Double = 100.0
-
+    
     // Buffer for storing EMG data with timestamps (each entry includes data and the timestamp)
     private var timestampBuffer = PriorityQueue<TimestampedData>(ascending: true, startingValues: [])
     private let bufferLimit = 500 // Limit the buffer size to 500 values, in case  data comes in bursts
     
     ///process BLE data in the background
     private let emgProcessingQueue = DispatchQueue(label: "com.emg.processing", qos: .userInitiated)
+    var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     
     //disconnect device
     @Published var connectionErrorMessage: String? = nil
     @Published var showAlert = false // Controls the visibility of the alert
     @Published var alertMessage = "" // Stores the alert message
+    //moving average timestamp normalization
+    private var timestampOffsetBuffer: [CFTimeInterval] = []
+    
+    
+    var startTime: CFTimeInterval? // Holds the timestamp when first packet arrives
 
+    
     init(emg: emgGraph) {
         self.emg = emg
         super.init()
-        myCentral = CBCentralManager(delegate: self, queue: nil)
+        
+        // Create a background queue for BLE operations
+        let backgroundQueue = DispatchQueue.global(qos: .background)
+        myCentral = CBCentralManager(delegate: self, queue: backgroundQueue)
     }
-
+    // background task app for maintaining connections active after locking down cellphone
+    func beginBackgroundTask() {
+        backgroundTask = UIApplication.shared.beginBackgroundTask {
+            print("⚠️ Background task expired.")
+            UIApplication.shared.endBackgroundTask(self.backgroundTask)
+            self.backgroundTask = .invalid
+        }
+    }
+    
+    func endBackgroundTask() {
+        UIApplication.shared.endBackgroundTask(backgroundTask)
+        backgroundTask = .invalid
+    }
+    
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         DispatchQueue.main.async {
             self.BLEisOn = (central.state == .poweredOn)
+            
+            if central.state == .poweredOn {
+                // ✅ Restart scanning in the background
+                self.startScanning()
+            } else {
+                print("⚠️ Bluetooth is off, cannot scan.")
+            }
         }
     }
+    
     func checkBluetoothStatus() {
         if !BLEisOn {
             print("⚠️ Bluetooth is not on. Please enable Bluetooth.")
             return
         }
     }
-
+    
     func checkBluetoothPermissions() {
         switch CBManager.authorization {
         case .allowedAlways:
@@ -183,7 +218,7 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
             print("Bluetooth authorization pending")
         }
     }
-
+    
     func startScanning() {
         guard !isConnected else {
             print("🔹 Already connected, skipping scanning.")
@@ -198,13 +233,13 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
         
         myCentral.scanForPeripherals(withServices: nil, options: nil)
     }
-
-
+    
+    
     func stopScanning() {
         print("Stop Scanning")
         myCentral.stopScan()
     }
-
+    
     func connectSensor(p: Peripheral) {
         // Check Bluetooth status before attempting connection
         checkBluetoothStatus()
@@ -221,21 +256,21 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
         if myCentral.isScanning {
             myCentral.stopScan()
         }
-
+        
         // Debugging log for the connection attempt
         print("🔄 Connecting to: \(CBPeripherals[p.id].name ?? "Unknown")")
-
+        
         // Get the peripheral we're trying to connect to
         let peripheral = CBPeripherals[p.id]
         myCentral.connect(peripheral, options: nil)
-
+        
         // Safety timeout: If the connection hasn't succeeded in 5 seconds, cancel and retry
         DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 10.0) {
             if !self.isConnected {
                 // Timeout reached, cancel connection attempt
                 print("❌ Connection attempt timed out. Cancelling attempt and retrying.")
                 self.myCentral.cancelPeripheralConnection(peripheral)
-
+                
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                     // If there are more reconnection attempts left, try reconnecting
                     if self.reconnectionAttempts < self.maxReconnectionAttempts {
@@ -252,54 +287,56 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
             }
         }
     }
-
-
+    
+    
     // Connecting to the correct device - ANR Corp
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
         if let manufacturerData = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
            manufacturerData.count >= 2 {
             let companyID = UInt16(manufacturerData[1]) << 8 | UInt16(manufacturerData[0]) // Little-endian
             if companyID != 0x05DA {
-                print("Skipping non-ANR device")
+                let now = CACurrentMediaTime()
+                if now - lastSkippedLogTime > 5.0 {  // ✅ Print log only every 5 seconds
+                    print("Skipping non-ANR device")
+                    lastSkippedLogTime = now  // Update last log time
+                }
                 return
             }
         } else {
-            print("No Manufacturer Specific Data found, skipping device.")
+            let now = CACurrentMediaTime()
+            if now - lastSkippedLogTime > 5.0 {  // ✅ Print log only every 5 seconds
+                print("No Manufacturer Specific Data found, skipping device.")
+                lastSkippedLogTime = now
+            }
             return
         }
-
+        
         let peripheralName = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? "Unknown"
         print("Discovered device: \(peripheralName) with RSSI: \(RSSI.intValue)")
-
+        
         let newPeripheral = Peripheral(id: BLEPeripherals.count, name: peripheralName, rssi: RSSI.intValue)
         DispatchQueue.main.async {
             self.BLEPeripherals.append(newPeripheral)
         }
         CBPeripherals.append(peripheral)
-
-        print("Added device: \(peripheralName) with RSSI: \(RSSI.intValue)")
     }
-
+    
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         print("✅ Connected to \(peripheral.name ?? "Unknown Device")")
-
+        
         DispatchQueue.main.async {
             self.isConnected = true
         }
-
+        
         myCentral.stopScan()
-        // ✅ Assign delegate only if it’s not already set
-            if peripheral.delegate !== self {
-                peripheral.delegate = self
-                print("🔄 Reassigned peripheral delegate after reconnection.")
-            } else {
-                print("⚡ Peripheral delegate was already set, skipping reassignment.")
-            }
-
-        peripheral.discoverServices(nil)  // ✅ Rediscover services to restore notifications
-        print("🔄 Reassigned peripheral delegate after reconnection.")
-
-        // ✅ Ensure notifications are re-enabled for EMG characteristic after reconnection
+        
+        // ✅ Assign delegate to the peripheral (moved outside condition)
+        peripheral.delegate = self
+        
+        // ✅ Discover services
+        peripheral.discoverServices(nil)
+        
+        // ✅ Ensure notifications remain active after connection
         if let emgCharacteristic = self.emgCharacteristic {
             peripheral.setNotifyValue(true, for: emgCharacteristic)
             print("✅ Notifications re-enabled for \(emgCharacteristic.uuid)")
@@ -307,17 +344,18 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
             print("⚠️ No EMG characteristic found yet. Waiting for discovery...")
         }
     }
-
-
+    
+    
+    
     // if the device is disconnected wait 1 second and try to restablish connection
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         print("❌ Disconnected from \(peripheral.name ?? "Unknown Device")")
-
+        
         // Update UI to reflect the disconnected state
         DispatchQueue.main.async {
             self.isConnected = false
         }
-
+        
         // Prevent data loss by keeping recent timestamps
         DispatchQueue.global(qos: .background).async {
             self.receivedValuesPerTimestamp = self.receivedValuesPerTimestamp.filter { CACurrentMediaTime() - $0.key < 5 }
@@ -338,15 +376,15 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
         // Increment reconnection attempt counter
         reconnectionAttempts += 1
         print("🔄 Attempting to reconnect (\(reconnectionAttempts)/\(maxReconnectionAttempts))...")
-
+        
         // Prevent duplicate reconnection logs
         if reconnectionAttempts == 1 {
             print("🔄 First reconnection attempt. Initiating reconnection sequence.")
         } else {
             print("⚠️ Reconnection attempt (\(reconnectionAttempts)/\(maxReconnectionAttempts)) in progress...")
         }
-        // Reduce wait time for faster reconnection (2 seconds before retry)
-        DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 2.0) {
+        // Reduce wait time for faster reconnection (5 seconds before retry)
+        DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 5.0) {
             self.myCentral.connect(peripheral, options: nil)
         }
         // Trigger the UI to reflect ongoing reconnection attempts
@@ -356,7 +394,7 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
             self.showAlert = true
         }
     }
-
+    
     // SAR
     func calculateSignalAcquisitionRatio() {
         let now = CACurrentMediaTime()
@@ -366,7 +404,7 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
         
         let sar = (totalPacketsReceived > 0) ? (Double(totalPacketsReceived) / Double(totalPacketsExpected)) * 100 : 0.0
         lastSARUpdateTime = now
-
+        
         // Print logic based on SAR value:
         if sar == 100.0 {
             if lastSARValue != 100.0 || now - lastPrintTime >= 10.0 {
@@ -393,9 +431,18 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
     }
     func normalizeTimestamp(_ timestamp: CFTimeInterval, precision: Int = 1) -> CFTimeInterval {
         let multiplier = pow(10.0, Double(precision))
-        return round(timestamp * multiplier) / multiplier
+        let roundedTimestamp = round(timestamp * multiplier) / multiplier
+        
+        // ✅ Moving average timestamp correction
+        timestampOffsetBuffer.append(roundedTimestamp)
+        if timestampOffsetBuffer.count > 10 {
+            timestampOffsetBuffer.removeFirst()
+        }
+        
+        let correctedTimestamp = timestampOffsetBuffer.reduce(0, +) / Double(timestampOffsetBuffer.count)
+        return correctedTimestamp
     }
-
+    
     func processAndAppendEMGData(_ rawEMGData: [Float], timestamp: CFTimeInterval) {
         totalPackets += 1
         if rawEMGData.isEmpty {
@@ -407,24 +454,41 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
 
         // ✅ Only remove excess timestamps beyond `bufferLimit`
         while timestampBuffer.count > bufferLimit {
-            _ = timestampBuffer.pop()
+            _ = timestampBuffer.pop() // Remove oldest data only if exceeding safe limit
         }
 
-        let sanitizedData = rawEMGData.isEmpty ? [0.001] : rawEMGData.map { $0.isFinite ? $0 : 0.0 }
+        // ✅ Ensure the data is sanitized before appending
+        let sanitizedData: [Float] = rawEMGData.isEmpty ? [0.001] : rawEMGData.map { $0.isFinite ? $0 : 0.0 }
         let sanitizedCGFloatData = sanitizedData.map { CGFloat($0) }
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             let normalizedTimestamp = self.normalizeTimestamp(timestamp)
+
+            // ✅ Check for large gaps in timestamps
+            if let lastTimestamp = self.emg.timestamps.last {
+                let timeGap = normalizedTimestamp - lastTimestamp
+                if timeGap > 0.2 {
+                    print("⚠️ Large gap detected in timestamps! Filling missing data.")
+                    var tempTimestamp = lastTimestamp + 0.1
+                    while tempTimestamp < normalizedTimestamp {
+                        self.emg.append(values: [0.001], timestamp: tempTimestamp)
+                        tempTimestamp += 0.1
+                    }
+                }
+            }
+            
+
+            // ✅ Append sanitized data only once (fixed potential duplicate call)
+           // print("📡 BLE Data Received: \(sanitizedCGFloatData.count) values, latest timestamp: \(timestamp)")
+
+            if !self.emg.timestamps.isEmpty {
+            }
+
             self.emg.append(values: sanitizedCGFloatData, timestamp: normalizedTimestamp)
-
-            // ✅ Debug: Confirm UI Update T rigger
-            print("🔄 Triggering UI refresh after appending BLE data.")
-            self.emg.objectWillChange.send()
         }
-        
-    }
-
+    }    
+    
     // interpolation when packet lost and under adquisiton ratio is 10%
     func reconstructDataStream() {
         guard droppedPackets > 0, Float(droppedPackets) / Float(totalPackets) > packetLossThreshold else {
@@ -492,53 +556,167 @@ extension BLEManager: CBPeripheralDelegate {
         }
     }
 
+    func detectLostPackets(currentTimestamp: CFTimeInterval, previousTimestamp: CFTimeInterval?) {
+        guard let lastTimestamp = previousTimestamp else { return }
+        let expectedNextTimestamp = lastTimestamp + 0.1
+
+        let timeDifference = abs(currentTimestamp - expectedNextTimestamp)
+
+        // ✅ Adaptive packet loss detection
+        let adjustedThreshold = max(0.05, min(0.2, Float(droppedPackets) / Float(totalPackets))) // Adjust threshold dynamically
+
+        if timeDifference > Double(adjustedThreshold) {
+            print("⚠️ Packet loss detected! Expected: \(expectedNextTimestamp), Received: \(currentTimestamp)")
+            fillMissingPackets(from: lastTimestamp, to: currentTimestamp)
+        }
+    }
+
+
+    func fillMissingPackets(from lastTimestamp: CFTimeInterval, to newTimestamp: CFTimeInterval) {
+        var missingTimestamp = lastTimestamp + 0.1
+        while missingTimestamp < newTimestamp {
+            print("⚠️ Filling missing packet at \(missingTimestamp)")
+            emg.append(values: [0.0], timestamp: missingTimestamp)
+            missingTimestamp += 0.1
+        }
+    }
+
+    func fillMissingPacketsWithInterpolation(from lastTimestamp: CFTimeInterval, lastValue: CGFloat,
+                                             to newTimestamp: CFTimeInterval, newValue: CGFloat) {
+        var missingTimestamps: [CFTimeInterval] = []
+        var tempTimestamp = lastTimestamp + 0.1
+
+        while tempTimestamp < newTimestamp {
+            missingTimestamps.append(tempTimestamp)
+            tempTimestamp += 0.1
+        }
+
+        var interpolatedValues: [CGFloat]
+
+        if missingTimestamps.count < 10 {
+            // ✅ Use smooth interpolation for small gaps
+            interpolatedValues = cubicHermiteInterpolation(from: lastValue, to: newValue, timestamps: missingTimestamps)
+        } else {
+            // ✅ Use last known value for large gaps to prevent artificial drift
+            interpolatedValues = Array(repeating: lastValue, count: missingTimestamps.count)
+        }
+
+        for (index, timestamp) in missingTimestamps.enumerated() {
+            print("🔄 Interpolating Data: \(timestamp) -> \(interpolatedValues[index])")
+            emg.append(values: [interpolatedValues[index]], timestamp: timestamp)
+        }
+    }
+
+    /// 🔹 Cubic Hermite Interpolation for Smooth Packet Loss Handling
+    func cubicHermiteInterpolation(from previousValue: CGFloat, to nextValue: CGFloat, timestamps: [CFTimeInterval]) -> [CGFloat] {
+        let tRange = timestamps.count + 1
+        let step = 1.0 / CGFloat(tRange)
+
+        return (1..<tRange).map { i in
+            let t = CGFloat(i) * step
+            let t2 = t * t
+            let t3 = t2 * t
+
+            return (2 * t3 - 3 * t2 + 1) * previousValue + (t3 - 2 * t2 + t) * 0 + (-2 * t3 + 3 * t2) * nextValue + (t3 - t2) * 0
+        }
+    }
+
+    // **Improved Interpolation Function**
+    func interpolateData(from previousValue: CGFloat, to nextValue: CGFloat, timestamps: [CFTimeInterval]) -> [CGFloat] {
+        let step = (nextValue - previousValue) / CGFloat(timestamps.count + 1)
+        return (1...timestamps.count).map { previousValue + (step * CGFloat($0)) }
+    }
+
+    
+    
 
     // Packet loss handling and timastamps
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        if let error = error {
-            print("Error updating value for characteristic: \(error.localizedDescription)")
+        // ✅ Background task to allow processing when the app is in the background
+        var backgroundTask: UIBackgroundTaskIdentifier?
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "BLEDataProcessing") {
+            print("⚠️ Background task expired.")
+            if let task = backgroundTask {
+                UIApplication.shared.endBackgroundTask(task)
+            }
+            backgroundTask = .invalid
+        }
+
+        guard let task = backgroundTask, task != .invalid else {
+            print("⚠️ Failed to start background task.")
             return
         }
 
+        defer {
+            UIApplication.shared.endBackgroundTask(task)
+            backgroundTask = .invalid
+        }
+
+        // ✅ Error handling
+        if let error = error {
+            print("❌ Error updating value for characteristic: \(error.localizedDescription)")
+            return
+        }
+        // ✅ Track first timestamp when data arrives
+        if startTime == nil {
+            startTime = CACurrentMediaTime() // Save first timestamp
+        }
+
+        // ✅ Check if we are within the first 5 seconds
+        //if let startTime = startTime, CACurrentMediaTime() - startTime < 5 {
+         //   print("⏳ Stabilization period active: Ignoring data for first 5 seconds.")
+        //    return // Skip processing
+      //  }
+
+
         switch characteristic.uuid {
-        case CBUUID(string: "2A58"): // EMG Data
+        case CBUUID(string: "2A58"): // ✅ EMG Data
             guard let characteristicData = characteristic.value, characteristicData.count % 2 == 0 else {
-                print("Error: Invalid data length for EMG characteristic")
+                print("❌ Error: Invalid EMG data length")
                 return
             }
 
-            let systemTimestamp = CACurrentMediaTime()
+            let systemTimestamp = normalizeTimestamp(CACurrentMediaTime()) // ✅ Ensure timestamp precision
 
-            var rawValues: [Float] = []
-            for index in stride(from: 0, to: characteristicData.count, by: 2) {
-                let rawValue = UInt16(characteristicData[index]) | (UInt16(characteristicData[index + 1]) << 8)
-                let normalizedValue = Float(rawValue) / 1000.0
-                rawValues.append(normalizedValue.isFinite ? normalizedValue : 0.0)
+            // ✅ Extract EMG values efficiently
+            var rawValues: [Float] = stride(from: 0, to: characteristicData.count, by: 2).map {
+                let rawValue = UInt16(characteristicData[$0]) | (UInt16(characteristicData[$0 + 1]) << 8)
+                return Float(rawValue) / 1000.0
             }
 
+            // ✅ Replace NaN values with 0.0
+            rawValues = rawValues.map { $0.isFinite ? $0 : 0.0 }
+
+            // ✅ Initialize timestamps on first-time connection
             if firstSampleTimestamp == nil || expectedNextTimestamp == nil {
                 firstSampleTimestamp = systemTimestamp
                 expectedNextTimestamp = firstSampleTimestamp
+                print("✅ Initialized firstSampleTimestamp: \(firstSampleTimestamp!)")
             } else if abs(systemTimestamp - expectedNextTimestamp!) > 1.0 {
-                // Large gap detected, realign timestamps
-                print("⚠️ Large gap detected after reconnection. Realigning expected timestamp.")
+                print("⚠️ Large gap detected at start-up. Resetting expected timestamp.")
                 expectedNextTimestamp = systemTimestamp
             }
 
-           
+
+            // ✅ Detect & realign large timestamp gaps
+            if abs(systemTimestamp - expectedNextTimestamp!) > 1.0 {
+                print("⚠️ Large timestamp gap detected. Realigning...")
+                expectedNextTimestamp = systemTimestamp
+            }
+
             var timestamp: CFTimeInterval
             if let expectedTime = expectedNextTimestamp {
+                
                 let timeDifference = systemTimestamp - expectedTime
                 if abs(timeDifference) > 0.8 {
-                    print("⚠️ Packet loss detected! Inserting 0.0 values.")
-                    while expectedNextTimestamp! + 0.1 < systemTimestamp {
-                        if receivedValuesPerTimestamp[expectedNextTimestamp!] == nil {
-                            receivedValuesPerTimestamp[expectedNextTimestamp!] = [0.0]
-                            totalPacketsExpected += 1
-                        }
-                        expectedNextTimestamp! += 0.1
-                    }
+                    print("⚠️ Packet loss detected! Performing interpolation.")
+                    fillMissingPacketsWithInterpolation(from: expectedTime,
+                                                        lastValue: CGFloat(rawValues.first ?? 0.0),
+                                                        to: systemTimestamp,
+                                                        newValue: CGFloat(rawValues.first ?? 0.0))
+
                 }
+
                 timestamp = normalizeTimestamp(expectedTime)
                 expectedNextTimestamp = expectedTime + 0.1
             } else {
@@ -546,17 +724,19 @@ extension BLEManager: CBPeripheralDelegate {
                 expectedNextTimestamp = systemTimestamp + 0.1
             }
 
+            // ✅ Store received values in the buffer
             receivedValuesPerTimestamp[timestamp] = rawValues
             totalPacketsReceived += 1
             totalPacketsExpected += 1
 
+            // ✅ More efficient buffer cleanup (prevents overflow)
             if receivedValuesPerTimestamp.count >= rollingBufferLimit {
-                let oldestKey = receivedValuesPerTimestamp.keys.sorted().first!
-                print("🔄 Removing oldest timestamp: \(oldestKey) to prevent buffer overflow")
-                receivedValuesPerTimestamp.removeValue(forKey: oldestKey)
+                receivedValuesPerTimestamp.removeValue(forKey: receivedValuesPerTimestamp.keys.min()!)
             }
 
-            print("📊 Timestamp: \(timestamp) | Received \(rawValues.count) EMG samples")
+         //   print("📊 Timestamp: \(timestamp) | Received \(rawValues.count) EMG samples")
+            
+            // ✅ Process & Append EMG data
             calculateSignalAcquisitionRatio()
             reconstructDataStream()
             DispatchQueue.main.async {
@@ -564,7 +744,7 @@ extension BLEManager: CBPeripheralDelegate {
             }
 
         default:
-            print("Unhandled characteristic UUID: \(characteristic.uuid)")
+            print("⚠️ Unhandled characteristic UUID: \(characteristic.uuid)")
         }
     }
 }
