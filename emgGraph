@@ -1,4 +1,3 @@
-
 import CoreGraphics
 import SwiftUI
 
@@ -13,6 +12,7 @@ class emgGraph: ObservableObject {
     var shortTermRMSValues: [Float] = [] // Short-term RMS values for export
     var timestamps: [CFTimeInterval] = [] // Timestamps for each recorded value
     var recording_duration: CFTimeInterval = 0 // To store the recording duration
+    
     
     
     var recording: Bool = false // Recording state
@@ -31,12 +31,19 @@ class emgGraph: ObservableObject {
     var droppedPacketTimestamps: [CFTimeInterval] = [] // Stores timestamps of dropped packets
     
     // Set maximum buffer size
-    private let maxBufferSize = 5000
+    private let maxBufferSize = 7000
+    private var bufferLimit: Int {
+        return timestamps.count < 200 ? 2000 : 5000 // Allow more samples at start
+    }
     
     
-    //prevent lag in UI at high frequencies, throttle UI update with timer of 100ms
+    
+    //prevent lag in UI at high frequencies, throttle UI update with timer of 300ms
     private var lastUIUpdateTime: CFTimeInterval = 0
-    private let uiUpdateInterval: CFTimeInterval = 0.5 // Update every 100ms
+    private var uiUpdateInterval: CFTimeInterval {
+        return timestamps.count < 200 ? 0.05 : 0.1 // Faster updates for first 200 values
+    }
+    
     
     init(firstValues: [CGFloat]) {
         values = firstValues
@@ -151,7 +158,15 @@ class emgGraph: ObservableObject {
     }
     
     func resetGraph() {
-        DispatchQueue.main.async {
+        print("🔄 Resetting Graph...")
+        
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else {
+                print("⚠️ Reset skipped: Self is nil.")
+                return
+            }
+            
+            // ✅ Step 1: Clear all stored data safely
             self.values.removeAll()
             self.timestamps.removeAll()
             self.oneSecondRMSHistory.removeAll()
@@ -164,27 +179,55 @@ class emgGraph: ObservableObject {
             self.oneSecondRMSBuffer.removeAll()
             self.longTermRMSBuffer.removeAll()
             self.shortTermSampleCounter = 0
-            print("✅ Reset completed - added placeholder values to avoid empty graph.")
-            // ✅ Print to check if values exist
-            print("🔍 Graph values count after reset: \(self.values.count)")
-            print("🔍 Graph timestamps count after reset: \(self.timestamps.count)")
             
-            // ✅ Add placeholder values to prevent empty graph
-            self.values.append(contentsOf: Array(repeating: 0.001, count: 50))
-            self.oneSecondRMSHistory.append(contentsOf: [0.0, 0.001])
-            self.shortTermRMSHistory.append(contentsOf: [0.0, 0.001])
-            self.max10SecRMSHistory.append(contentsOf: [0.0, 0.001])
+            print("✅ Graph data cleared.")
             
-            print("✅ Reset completed - added placeholder values to avoid empty graph.")
+            // ✅ Step 2: Prevent empty graph by adding placeholder values
+            let fakeStartTime = CACurrentMediaTime()
+            let resetCount = 50 // Simulate 5 seconds of fake data at 10Hz
             
-            // ✅ Force UI update
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                self.objectWillChange.send()
+            self.timestamps = (0..<resetCount).map { fakeStartTime + (Double($0) * 0.1) }
+            self.values = Array(repeating: 0.001, count: resetCount)
+            
+            self.oneSecondRMSHistory = Array(repeating: 0.001, count: resetCount)
+            self.shortTermRMSHistory = Array(repeating: 0.001, count: resetCount)
+            self.max10SecRMSHistory = Array(repeating: 0.001, count: resetCount)
+            
+            // ✅ Step 3: Ensure values and timestamps are synchronized
+            if self.values.count != self.timestamps.count {
+                let diff = abs(self.values.count - self.timestamps.count)
+                if self.values.count > self.timestamps.count {
+                    self.values.removeFirst(diff)
+                } else {
+                    let lastTimestamp = self.timestamps.last ?? fakeStartTime
+                    let missingTimestamps = (0..<diff).map { lastTimestamp + (Double($0) * 0.1) }
+                    self.timestamps.append(contentsOf: missingTimestamps)
+                }
+            }
+            
+            print("🔍 Post-Reset Check: Values Count: \(self.values.count), Timestamps Count: \(self.timestamps.count)")
+            
+            // ✅ Step 4: Ensure a safe UI refresh
+            DispatchQueue.main.async {
+                self.values.removeAll()
+                self.timestamps.removeAll()
+                self.oneSecondRMSHistory.removeAll()
+                self.shortTermRMSHistory.removeAll()
+                self.max10SecRMSHistory.removeAll()
                 
+                print("✅ Graph data cleared.")
                 
+                let fakeStartTime = CACurrentMediaTime()
+                self.timestamps = (0..<50).map { fakeStartTime + (Double($0) * 0.1) }
+                self.values = Array(repeating: 0.001, count: 50)
+                
+                print("🔍 Post-Reset Check: Values Count: \(self.values.count), Timestamps Count: \(self.timestamps.count)")
             }
         }
     }
+    
+    
+    
     
     private func saveToFile(_ dataset: String) {
         DispatchQueue.global(qos: .background).async {
@@ -261,6 +304,7 @@ class emgGraph: ObservableObject {
     }
     
     func updateMax10SecRMS(_ oneSecondRMS: CGFloat) {
+        print("📊 RMS Update: Current Count =", oneSecondRMSHistory.count)
         longTermRMSBuffer.append(oneSecondRMS)
         
         if longTermRMSBuffer.count > longTermRMSWindowSize {
@@ -290,7 +334,7 @@ class emgGraph: ObservableObject {
     }
     
     func append(values: [CGFloat], timestamp: CFTimeInterval) {
-        print("🔄 append(values: \(values), timestamp: \(timestamp)) called") // Debug log
+       // print("🔄 append(values: \(values), timestamp: \(timestamp)) called") // Debug log
         
         // ✅ Ensure new data is received before proceeding
         guard !values.isEmpty else {
@@ -301,7 +345,7 @@ class emgGraph: ObservableObject {
         // ✅ Auto-start recording if it was inactive
         if !recording {
             print("⚠️ Recording was not active. Starting now...")
-            record() // Auto-start recording when new data arrives.
+            record()
         }
         
         // ✅ Ensure recording is active before appending
@@ -316,24 +360,36 @@ class emgGraph: ObservableObject {
             return
         }
         
-        // ✅ **Fix: Ensure Values & Timestamps Stay in Sync**
+        // ✅ Fix: Ensure timestamps and values stay in sync
         if timestamps.count > recorded_values.count {
             print("⚠️ Timestamps count (\(timestamps.count)) exceeds values count (\(recorded_values.count))! Adjusting...")
             timestamps.removeFirst(timestamps.count - recorded_values.count)
-        }
-        
-        if recorded_values.count > timestamps.count {
+        } else if recorded_values.count > timestamps.count {
             print("⚠️ Values count (\(recorded_values.count)) exceeds timestamps count (\(timestamps.count))! Adjusting...")
             recorded_values.removeFirst(recorded_values.count - timestamps.count)
         }
         
-        // ✅ Handle missing timestamps and packet loss
+        // ✅ Prevent duplicate timestamps and ensure a monotonic sequence
+        var normalizedTimestamp = normalizeTimestamp(timestamp)
+        if let lastTimestamp = timestamps.last {
+            if normalizedTimestamp - lastTimestamp < 0.002 {
+                print("⚠️ Adjusting timestamp to prevent duplicates.")
+                normalizedTimestamp = lastTimestamp + 0.002
+            }
+            
+            // ✅ Prevent excessive jumps in timestamps
+            if normalizedTimestamp - lastTimestamp > 10.0 {
+                print("⚠️ Huge timestamp jump detected (>10s). Skipping to prevent UI errors.")
+                return
+            }
+        }
+        
+        // ✅ Handle missing timestamps and packet loss (Restored original logic)
         if let lastTimestamp = timestamps.last, let lastValue = recorded_values.last {
             var normalizedLastTimestamp = normalizeTimestamp(lastTimestamp)
             let normalizedCurrentTimestamp = normalizeTimestamp(timestamp)
-            
-            let maxAllowedGap: CFTimeInterval = 0.2 // Normal max gap for small gaps
-            let maxGapThreshold: CFTimeInterval = 3.0 // If gap >3s, avoid excessive interpolation
+            let maxAllowedGap: CFTimeInterval = 0.2
+            let maxGapThreshold: CFTimeInterval = 3.0 // Avoid excessive interpolation
             
             if normalizedCurrentTimestamp - normalizedLastTimestamp > maxGapThreshold {
                 print("⚠️ Large gap detected (>3s), skipping interpolation to prevent unrealistic values.")
@@ -341,40 +397,35 @@ class emgGraph: ObservableObject {
             } else {
                 while normalizedLastTimestamp + maxAllowedGap < normalizedCurrentTimestamp {
                     let missingTimestamp = normalizeTimestamp(normalizedLastTimestamp + 0.1)
-                    
-                    // ✅ Fill in missing data with last known value instead of averaging
                     recorded_values.append(lastValue)
                     timestamps.append(missingTimestamp)
                     droppedPacketTimestamps.append(missingTimestamp)
-                    
                     print("⚠️ Small gap detected. Interpolating missing timestamp \(missingTimestamp) with value \(lastValue).")
-                    
                     normalizedLastTimestamp += 0.1
                 }
             }
         }
         
-        // Append new values and timestamps
+        // ✅ Append new values and timestamps
         for value in values {
-            // ✅ Detect suspiciously constant EMG values (sensor issue)
-            if recorded_values.count > 10 { // Ensure enough data points for comparison
+            // ✅ Detect suspiciously constant EMG values
+            if recorded_values.count > 10 {
                 let lastTenValues = recorded_values.suffix(10)
                 let maxDiff = lastTenValues.max()! - lastTenValues.min()!
-                
-                if maxDiff < 0.0001 { // If EMG signal variation is too small
+                if maxDiff < 0.0001 {
                     print("⚠️ Warning: Minimal signal variation detected at timestamp \(timestamp). Possible sensor issue?")
                 }
             }
             
             // ✅ Sanitize and store the value
-            let sanitizedValue = value.isFinite ? value : 0.0 // Replace NaN with 0.0
+            let sanitizedValue = value.isFinite ? value : 0.0
             recorded_values.append(sanitizedValue)
-            timestamps.append(timestamp)
-            print("✅ Appended value: \(sanitizedValue), timestamp: \(timestamp)") // Debug log
+            timestamps.append(normalizedTimestamp)
+            print("✅ Appended value: \(sanitizedValue), timestamp: \(normalizedTimestamp)")
             
             if value.isNaN {
-                print("⚠️ NaN detected at timestamp \(timestamp). Marked as dropped packet.")
-                droppedPacketTimestamps.append(timestamp)
+                print("⚠️ NaN detected at timestamp \(normalizedTimestamp). Marked as dropped packet.")
+                droppedPacketTimestamps.append(normalizedTimestamp)
             }
             
             // ✅ Update RMS buffers
@@ -428,25 +479,23 @@ class emgGraph: ObservableObject {
                 return
             }
             
-            // Throttle UI updates to avoid blinking (adding throttle check)
-            if now - self.lastUIUpdateTime >= self.uiUpdateInterval {
-                self.lastUIUpdateTime = now
-                self.objectWillChange.send() // Trigger UI update after interval
-            }
-            
             // ✅ Append values efficiently
             self.values.append(contentsOf: values.filter { $0.isFinite })
             
             // ✅ Prevent buffer overflow
             let bufferLimit = min(maxBufferSize, 1000)
             if self.values.count > bufferLimit {
-                // Instead of dropping 20%, you could try a smaller percentage, or you could drop the oldest samples.
                 let dropCount = self.values.count - (bufferLimit * 90 / 100) // Keep 90% of recent data
                 self.values.removeFirst(dropCount)
                 self.timestamps.removeFirst(dropCount)
                 self.recorded_values.removeFirst(dropCount)
             }
+            
+            // ✅ Throttle UI updates
+            if now - self.lastUIUpdateTime >= self.uiUpdateInterval {
+                self.lastUIUpdateTime = now
+                self.objectWillChange.send()
+            }
         }
     }
 }
-        
