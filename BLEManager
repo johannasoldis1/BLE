@@ -26,7 +26,7 @@ struct TimestampedData: Comparable {
 struct Peripheral: Identifiable {
     let id: Int
     let name: String
-    let rssi: Int
+    var rssi: Int
 }
 
 // Priority Queue Implementation
@@ -161,7 +161,7 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
     @Published var alertMessage = "" // Stores the alert message
     //moving average timestamp normalization
     private var timestampOffsetBuffer: [CFTimeInterval] = []
-    
+  
     
     var startTime: CFTimeInterval? // Holds the timestamp when first packet arrives
 
@@ -264,24 +264,24 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
         let peripheral = CBPeripherals[p.id]
         myCentral.connect(peripheral, options: nil)
         
-        // Safety timeout: If the connection hasn't succeeded in 5 seconds, cancel and retry
-        DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 10.0) {
-            if !self.isConnected {
-                // Timeout reached, cancel connection attempt
-                print("❌ Connection attempt timed out. Cancelling attempt and retrying.")
-                self.myCentral.cancelPeripheralConnection(peripheral)
-                
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                    // If there are more reconnection attempts left, try reconnecting
-                    if self.reconnectionAttempts < self.maxReconnectionAttempts {
-                        self.reconnectionAttempts += 1
-                        print("🔄 Retrying reconnection (\(self.reconnectionAttempts)/\(self.maxReconnectionAttempts))...")
-                        self.myCentral.connect(peripheral, options: nil)
-                    } else {
-                        // Max attempts reached, stop retrying
-                        print("🔴 Max reconnection attempts reached. Stopping reconnection.")
-                        self.alertMessage = "Check device battery and Bluetooth stability."
-                        self.showAlert = true
+        // ✅ Ensure the second attempt is properly triggered,If the connection hasn't succeeded in 5 seconds, cancel and retry
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                        if self.reconnectionAttempts < self.maxReconnectionAttempts {
+                            self.reconnectionAttempts += 1
+                            print("🔄 Retrying connection (\(self.reconnectionAttempts)/\(self.maxReconnectionAttempts))...")
+                            self.myCentral.connect(peripheral, options: nil)
+                            
+                            // ✅ FIX: Ensure the counter moves to the second attempt and resets properly
+                            DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 10.0) {
+                                if !self.isConnected && self.reconnectionAttempts == self.maxReconnectionAttempts {
+                                    print("🔴 Second attempt failed. Stopping reconnection.")
+
+                                    DispatchQueue.main.async {
+                                        self.alertMessage = "Check device battery and Bluetooth stability."
+                                        self.showAlert = true
+                                    }
+                                    
+                                    self.reconnectionAttempts = 0 // ✅ Only reset after two failed attempts
                     }
                 }
             }
@@ -314,12 +314,27 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
         let peripheralName = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? "Unknown"
         print("Discovered device: \(peripheralName) with RSSI: \(RSSI.intValue)")
         
+        // ✅ Check if the device is already in the list (prevents duplicates)
+            if let existingIndex = BLEPeripherals.firstIndex(where: { $0.name == peripheralName }) {
+                DispatchQueue.main.async {
+                    self.BLEPeripherals[existingIndex].rssi = RSSI.intValue  // ✅ Update RSSI instead of duplicating
+                }
+                return  // ✅ Stop further processing to prevent duplicates
+            }
+
+            // ✅ Check if CBPeripheral is already stored (avoids duplicate connections)
+            if !CBPeripherals.contains(where: { $0.identifier == peripheral.identifier }) {
+                CBPeripherals.append(peripheral)  // ✅ Only add if it's new
+            }
+        
         let newPeripheral = Peripheral(id: BLEPeripherals.count, name: peripheralName, rssi: RSSI.intValue)
         DispatchQueue.main.async {
             self.BLEPeripherals.append(newPeripheral)
         }
         CBPeripherals.append(peripheral)
     }
+    
+    
     
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         print("✅ Connected to \(peripheral.name ?? "Unknown Device")")
@@ -348,52 +363,106 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
     
     
     // if the device is disconnected wait 1 second and try to restablish connection
+    
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         print("❌ Disconnected from \(peripheral.name ?? "Unknown Device")")
+        
+        // ✅ Check if calibration is active. If so, do NOT attempt to reconnect.
+        if emg.isCalibrating {
+            print("⚠️ Device disconnected during calibration. Skipping reconnection attempts.")
+            return
+        }
         
         // Update UI to reflect the disconnected state
         DispatchQueue.main.async {
             self.isConnected = false
         }
         
-        // Prevent data loss by keeping recent timestamps
+        
+        // ✅ Check if maximum reconnection attempts reached
         DispatchQueue.global(qos: .background).async {
             self.receivedValuesPerTimestamp = self.receivedValuesPerTimestamp.filter { CACurrentMediaTime() - $0.key < 5 }
             print("🔄 Keeping only recent timestamps to prevent data loss after reconnection")
         }
-        // Prevent infinite reconnection attempts
+        
+        // ✅ Check if maximum reconnection attempts reached
         if reconnectionAttempts >= maxReconnectionAttempts {
             print("🔴 Max reconnection attempts reached. Stopping reconnection.")
-            
-            // Show alert when max reconnection attempts are reached
+
+            // ✅ Update alert on max failures
             DispatchQueue.main.async {
                 self.alertMessage = "Max reconnection attempts reached. Verify Bluetooth connection and device battery."
                 self.showAlert = true
-                
             }
             return
         }
-        // Increment reconnection attempt counter
-        reconnectionAttempts += 1
-        print("🔄 Attempting to reconnect (\(reconnectionAttempts)/\(maxReconnectionAttempts))...")
         
-        // Prevent duplicate reconnection logs
-        if reconnectionAttempts == 1 {
-            print("🔄 First reconnection attempt. Initiating reconnection sequence.")
-        } else {
-            print("⚠️ Reconnection attempt (\(reconnectionAttempts)/\(maxReconnectionAttempts)) in progress...")
-        }
-        // Reduce wait time for faster reconnection (5 seconds before retry)
-        DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 5.0) {
-            self.myCentral.connect(peripheral, options: nil)
-        }
-        // Trigger the UI to reflect ongoing reconnection attempts
-        DispatchQueue.main.async {
-            // Update the alert message to show reconnection attempts in progress
-            self.alertMessage = "Attempting to reconnect... (\(self.reconnectionAttempts)/\(self.maxReconnectionAttempts))"
-            self.showAlert = true
-        }
-    }
+
+    
+
+        // ✅ Start first reconnection attempt
+           reconnectionAttempts += 1
+           print("🔄 Attempting to reconnect (\(reconnectionAttempts)/\(maxReconnectionAttempts))...")
+
+           DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 3.0) {
+               if !self.isConnected {
+                   print("🔄 First reconnection attempt in progress...")
+                   self.myCentral.connect(peripheral, options: nil)
+               }
+           }
+        
+        
+        // ✅ If first attempt fails, schedule a second attempt
+           DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 7.0) {
+               DispatchQueue.main.async {
+                   if !self.isConnected && self.reconnectionAttempts < self.maxReconnectionAttempts {
+                       self.reconnectionAttempts += 1
+                       print("⚠️ First reconnection attempt failed. Trying again (\(self.reconnectionAttempts)/\(self.maxReconnectionAttempts))...")
+
+                       // ✅ Update alert for second attempt
+                       self.alertMessage = "Device disconnected. Reconnecting... (\(self.reconnectionAttempts)/\(self.maxReconnectionAttempts))"
+                       self.showAlert = true
+
+                       DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 4.0) {
+                           if !self.isConnected {
+                               print("🔄 Second reconnection attempt in progress...")
+                               self.myCentral.connect(peripheral, options: nil)
+                           }
+                       }
+                   }
+               }
+           }
+
+           // ✅ If second attempt fails, update alert with failure message
+           DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 10.0) {
+               DispatchQueue.main.async {
+                   if !self.isConnected {
+                       print("🔴 Both reconnection attempts failed.")
+                       self.alertMessage = "Check device battery and Bluetooth stability."
+                       self.showAlert = true
+                       
+                       // ✅ Stop automatic reconnections
+                                 self.reconnectionAttempts = 0  // Reset attempt counter
+                       
+                       // ✅ CLEAR OLD BUFFERED DATA (Prevents old data from being processed on next connection)
+                                   //self.receivedValuesPerTimestamp.removeAll()   // ✅ Clear stored BLE data
+                                   //self.timestampBuffer = PriorityQueue<TimestampedData>(ascending: true)  // ✅ Reset priority queue
+                                   //self.totalPacketsReceived = 0
+                                   //self.totalPacketsExpected = 0
+                                   //self.droppedPackets = 0
+                                   //self.emg.timestamps.removeAll()  // ✅ Clear timestamps
+                                   //self.emg.recorded_values.removeAll()  // ✅ Remove old recorded values
+                                   //self.emg.recorded_rms.removeAll()  // ✅ Remove old RMS values
+                                   //self.emg.shortTermRMSValues.removeAll()  // ✅ Remove old short-term RMS
+
+                                   //print("🗑️ Cleared old data. Only fresh data will be processed when sensor reconnects.")
+                                 
+                                 // ✅ Optionally restart scanning so the device appears again in the list
+                                 self.startScanning()
+                   }
+               }
+           }
+       }
     
     // SAR
     func calculateSignalAcquisitionRatio() {
@@ -448,46 +517,61 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate {
         if rawEMGData.isEmpty {
             droppedPackets += 1
         }
-
+        
         // ✅ Use a larger rolling buffer to prevent early removals
         timestampBuffer.push(TimestampedData(timestamp: timestamp, values: rawEMGData.isEmpty ? [0.001] : rawEMGData))
-
+        
         // ✅ Only remove excess timestamps beyond `bufferLimit`
         while timestampBuffer.count > bufferLimit {
             _ = timestampBuffer.pop() // Remove oldest data only if exceeding safe limit
         }
-
+        
         // ✅ Ensure the data is sanitized before appending
         let sanitizedData: [Float] = rawEMGData.isEmpty ? [0.001] : rawEMGData.map { $0.isFinite ? $0 : 0.0 }
         let sanitizedCGFloatData = sanitizedData.map { CGFloat($0) }
-
+        
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             let normalizedTimestamp = self.normalizeTimestamp(timestamp)
 
-            // ✅ Check for large gaps in timestamps
-            if let lastTimestamp = self.emg.timestamps.last {
-                let timeGap = normalizedTimestamp - lastTimestamp
-                if timeGap > 0.2 {
-                    print("⚠️ Large gap detected in timestamps! Filling missing data.")
-                    var tempTimestamp = lastTimestamp + 0.1
-                    while tempTimestamp < normalizedTimestamp {
-                        self.emg.append(values: [0.001], timestamp: tempTimestamp)
-                        tempTimestamp += 0.1
+                    // ✅ Calibration Mode: Handle Calibration Logic
+                    if self.emg.isCalibrating {
+                        print("📡 Collecting Calibration Data: \(sanitizedCGFloatData.count) values")
+                        self.emg.calibrationBuffer.append(contentsOf: sanitizedCGFloatData)
+                        self.emg.calibrationMVEHistory.append(sanitizedCGFloatData.max() ?? 0.0)
+
+                        // ✅ Stop Calibration after 10 seconds
+                        if let start = self.emg.calibrationStartTime, CACurrentMediaTime() - start >= 10 {
+                            print("⏳ Calibration complete. Stopping MVE calibration.")
+                            self.emg.endMVECalibration()
+                        }
+                        return  // ❗ Skip normal data processing during calibration
                     }
+
+                    // ✅ Check for large gaps in timestamps
+                    if let lastTimestamp = self.emg.timestamps.last {
+                        let timeGap = normalizedTimestamp - lastTimestamp
+                        if timeGap > 0.2 {
+                            print("⚠️ Large gap detected in timestamps! Filling missing data.")
+                            var tempTimestamp = lastTimestamp + 0.1
+                            while tempTimestamp < normalizedTimestamp {
+                                self.emg.append(values: [0.001], timestamp: tempTimestamp)
+                                tempTimestamp += 0.1
+                            }
                 }
             }
             
-
+            
             // ✅ Append sanitized data only once (fixed potential duplicate call)
-           // print("📡 BLE Data Received: \(sanitizedCGFloatData.count) values, latest timestamp: \(timestamp)")
-
+            // print("📡 BLE Data Received: \(sanitizedCGFloatData.count) values, latest timestamp: \(timestamp)")
+            
             if !self.emg.timestamps.isEmpty {
             }
-
+            
             self.emg.append(values: sanitizedCGFloatData, timestamp: normalizedTimestamp)
         }
-    }    
+    }
+   
     
     // interpolation when packet lost and under adquisiton ratio is 10%
     func reconstructDataStream() {
@@ -657,6 +741,12 @@ extension BLEManager: CBPeripheralDelegate {
             print("❌ Error updating value for characteristic: \(error.localizedDescription)")
             return
         }
+        
+        // ✅ Reset reconnection attempts when data is successfully received
+            DispatchQueue.main.async {
+                self.isConnected = true
+                self.reconnectionAttempts = 0  // ✅ Prevents unnecessary reconnections
+            }
         // ✅ Track first timestamp when data arrives
         if startTime == nil {
             startTime = CACurrentMediaTime() // Save first timestamp
@@ -748,5 +838,6 @@ extension BLEManager: CBPeripheralDelegate {
         }
     }
 }
+
 
 
