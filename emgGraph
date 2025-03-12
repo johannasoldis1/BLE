@@ -6,6 +6,14 @@ class emgGraph: ObservableObject {
     @Published var oneSecondRMSHistory: [CGFloat] = [] // 1-second RMS values for display
     @Published var shortTermRMSHistory: [CGFloat] = [] // Short-term RMS values for display
     @Published var max10SecRMSHistory: [CGFloat] = [] // Max RMS values for the last 10 seconds
+    @Published var mveValue: CGFloat = 0.0  // Store Maximum Voluntary Exertion
+    @Published var percentMVEHistory: [CGFloat] = [] // Store %MVE over time
+    @Published var calibrationMVEHistory: [CGFloat] = [] // Store MVE during calibration
+    @Published var isCalibrating: Bool = false  // ✅ Ensure calibration is OFF at startup
+    //public var isCalibrating = false  // ✅ Ensure calibration does not start by default
+    
+    public var calibrationBuffer: [CGFloat] = []
+    public var calibrationStartTime: CFTimeInterval?
     
     var recorded_values: [CGFloat] = [] // Recorded raw EMG values for export
     var recorded_rms: [CGFloat] = [] // 1-second RMS values for export
@@ -30,6 +38,8 @@ class emgGraph: ObservableObject {
     private var shortTermSampleCounter = 0 // Counter for 0.1-second RMS updates
     var droppedPacketTimestamps: [CFTimeInterval] = [] // Stores timestamps of dropped packets
     
+
+    
     // Set maximum buffer size
     private let maxBufferSize = 7000
     private var bufferLimit: Int {
@@ -37,17 +47,17 @@ class emgGraph: ObservableObject {
     }
     
     
-    
     //prevent lag in UI at high frequencies, throttle UI update with timer of 300ms
     private var lastUIUpdateTime: CFTimeInterval = 0
     private var uiUpdateInterval: CFTimeInterval {
-        return timestamps.count < 200 ? 0.05 : 0.1 // Faster updates for first 200 values
+        return timestamps.count < 500 ? 0.05 : 0.1 // Faster updates for first 200 values
     }
     
     
     init(firstValues: [CGFloat]) {
         values = firstValues
     }
+    
     
     func record() {
         print("Recorded values before clearing: \(recorded_values.count)")
@@ -61,11 +71,25 @@ class emgGraph: ObservableObject {
         }
         
         DispatchQueue.main.async { [weak self] in
-            self?.max10SecRMSHistory.removeAll()
+           
             print("🔴 Starting Recording... Current emgGraph instance: \(String(describing: self))")
             self?.recording = true
-            self?.start_time = CACurrentMediaTime()
-            print("✅ Recording started successfully. Recording flag: \(String(describing: self?.recording))")
+            //self?.start_time = CACurrentMediaTime()
+          //  self?.isCalibrating = true // ✅ Start calibration phase
+          //  self?.calibrationStartTime = self?.start_time
+            //self?.mveValue = 0.0 // ✅ Reset MVE before calibration
+            print("🔴 Calibration started. Collecting MVE for 10 seconds...")
+        }
+        
+        func recordMVE() {
+            guard !values.isEmpty else {
+                print("⚠️ No EMG data available to calculate MVE.")
+                return
+            }
+            
+            let maxValue = values.max() ?? 0.0
+            mveValue = maxValue
+            print("✅ MVE Recorded: \(mveValue)")
         }
         
         // ✅ Only clear buffers for first-time recording
@@ -112,7 +136,8 @@ class emgGraph: ObservableObject {
         
         // Start preparing the dataset
         var dataset = "Recording Duration (s):,\(recording_duration)\n"
-        dataset += "Index,System Timestamp (s),EMG (Raw Data),0.1s RMS,1s RMS\n" // Column headers
+        dataset += "Maximum MVE:,\(mveValue)\n"  // ✅ Add this line
+        dataset += "Index,System Timestamp (s),EMG (Raw Data),0.1s RMS,1s RMS,%MVE\n" //column headers
         
         // ✅ Prevent duplicate timestamps and filter NaN values
         var seenTimestamps: Set<CFTimeInterval> = []
@@ -139,6 +164,33 @@ class emgGraph: ObservableObject {
             if index % self.oneSecondRMSWindowSize == 0 && index / self.oneSecondRMSWindowSize < self.recorded_rms.count {
                 oneSecondRMS = Float(self.recorded_rms[index / self.oneSecondRMSWindowSize]) // Convert CGFloat to Float
             }
+            // ✅ Calculate %MVE for the recorded EMG value
+            //let percentMVE = mveValue > 0 ? (rawValue / mveValue) * 100 : 0
+           // let rmsValue = calculateRMS(from: values.map { Float($0) })  // Compute RMS from new values
+            
+            let rmsValue = recorded_rms.indices.contains(index) ? recorded_rms[index] : 0.0
+            let percentMVE = percentMVEHistory.indices.contains(index) ? percentMVEHistory[index] : 0.0
+          //  let percentMVE = mveValue > 0 ? (rmsValue / mveValue) * 100 : 0
+
+
+            // ✅ Update max RMS dynamically during calibration
+           // if isCalibrating {
+          ///      mveValue = max(mveValue, CGFloat(rmsValue))  // Update max RMS only in calibration mode
+          //      print("🔵 Updating RMS Max Value: \(mveValue)")
+           // }
+
+            // ✅ Only update MVE during calibration
+            if isCalibrating {
+                mveValue = max(mveValue, CGFloat(rmsValue))  // Track highest RMS during calibration
+                print("🔵 Updating RMS Max Value During Calibration: \(mveValue)")
+            } else {
+                // ✅ Do NOT update MVE after calibration ends
+                print("🔒 Calibration is over. Keeping Max MVE fixed: \(mveValue)")
+            }
+
+            // ✅ Compute %MVE using RMS-based calculation
+         //   let percentMVE = mveValue > 0 ? (rmsValue / mveValue) * 100 : 0
+
             
             // Debug each row
             print("Row \(index): Timestamp \(systemTimestamp), Raw EMG \(rawValue), Short-Term RMS \(shortTermRMS), One-Second RMS \(oneSecondRMS)")
@@ -147,9 +199,10 @@ class emgGraph: ObservableObject {
             let emgData = rawValue.isNaN ? "0.0" : String(format: "%.6f", rawValue) // Format to 6 decimal places
             let rmsShortTerm = shortTermRMS.isNaN ? "0.0" : String(format: "%.6f", shortTermRMS)
             let rmsOneSecond = oneSecondRMS.isNaN ? "0.0" : String(format: "%.6f", oneSecondRMS)
+            let percentMVEString = percentMVE.isNaN ? "0.0" : String(format: "%.2f", percentMVE) // Format %MVE to 2 decimal places
             
-            // Append row to the dataset
-            dataset += "\(index),\(systemTimestamp),\(emgData),\(rmsShortTerm),\(rmsOneSecond)\n"
+            // ✅ Append row to the dataset, now including %MVE
+            dataset += "\(index),\(systemTimestamp),\(emgData),\(rmsShortTerm),\(rmsOneSecond),\(percentMVEString)\n"
         }
         
         // Save the dataset to a file
@@ -227,7 +280,43 @@ class emgGraph: ObservableObject {
     }
     
     
-    
+    func startMVECalibration() {
+        print("🚨 startMVECalibration() called! 🚨") // Debugging print statement
+            isCalibrating = true
+            calibrationBuffer.removeAll()
+            calibrationMVEHistory.removeAll()
+            calibrationStartTime = CACurrentMediaTime()
+            mveValue = 0  // Reset RMS max before calibration
+        print("🔄 Calibration Started: Buffer cleared. Start Time: \(calibrationStartTime ?? -1)")
+        }
+        
+    func endMVECalibration() {
+   //     isCalibrating = false
+       // if let maxValue = calibrationBuffer.max() {
+         //   mveValue = maxValue
+        
+        //if let maxValue = max10SecRMSHistory.max() {
+     //       mveValue = maxValue  // Store max RMS instead of raw EMG max
+            print("✅ Calibration Finished. MVE Value Stored: \(mveValue)")
+     //   } else {
+    //        print("⚠️ Calibration Failed! No values in buffer.")
+    //    }
+        
+        if isCalibrating {
+            if let maxValue = max10SecRMSHistory.max() {
+                mveValue = maxValue  // Store max RMS only from the calibration session
+                print("✅ Calibration Finished. New Max MVE Stored: \(mveValue)")
+            } else {
+                print("⚠️ Calibration Failed! No values in buffer.")
+            }
+        } else {
+            print("🔒 Calibration is over. Keeping previous MVE: \(mveValue)")
+        }
+
+        isCalibrating = false  // ✅ Ensure calibration is marked as done
+
+    }
+
     
     private func saveToFile(_ dataset: String) {
         DispatchQueue.global(qos: .background).async {
@@ -334,7 +423,7 @@ class emgGraph: ObservableObject {
     }
     
     func append(values: [CGFloat], timestamp: CFTimeInterval) {
-       // print("🔄 append(values: \(values), timestamp: \(timestamp)) called") // Debug log
+        // print("🔄 append(values: \(values), timestamp: \(timestamp)) called") // Debug log
         
         // ✅ Ensure new data is received before proceeding
         guard !values.isEmpty else {
@@ -342,160 +431,210 @@ class emgGraph: ObservableObject {
             return
         }
         
-        // ✅ Auto-start recording if it was inactive
-        if !recording {
-            print("⚠️ Recording was not active. Starting now...")
-            record()
-        }
-        
-        // ✅ Ensure recording is active before appending
-        guard recording else {
-            print("⚠️ Recording is not active. Data is not being appended.")
-            return
-        }
-        
-        // ✅ Ensure valid timestamp
-        guard timestamp.isFinite else {
-            print("❌ Invalid timestamp detected: \(timestamp). Skipping this entry.")
-            return
-        }
-        
-        // ✅ Fix: Ensure timestamps and values stay in sync
-        if timestamps.count > recorded_values.count {
-            print("⚠️ Timestamps count (\(timestamps.count)) exceeds values count (\(recorded_values.count))! Adjusting...")
-            timestamps.removeFirst(timestamps.count - recorded_values.count)
-        } else if recorded_values.count > timestamps.count {
-            print("⚠️ Values count (\(recorded_values.count)) exceeds timestamps count (\(timestamps.count))! Adjusting...")
-            recorded_values.removeFirst(recorded_values.count - timestamps.count)
-        }
-        
-        // ✅ Prevent duplicate timestamps and ensure a monotonic sequence
-        var normalizedTimestamp = normalizeTimestamp(timestamp)
-        if let lastTimestamp = timestamps.last {
-            if normalizedTimestamp - lastTimestamp < 0.002 {
-                print("⚠️ Adjusting timestamp to prevent duplicates.")
-                normalizedTimestamp = lastTimestamp + 0.002
-            }
-            
-            // ✅ Prevent excessive jumps in timestamps
-            if normalizedTimestamp - lastTimestamp > 10.0 {
-                print("⚠️ Huge timestamp jump detected (>10s). Skipping to prevent UI errors.")
-                return
-            }
-        }
-        
-        // ✅ Handle missing timestamps and packet loss (Restored original logic)
-        if let lastTimestamp = timestamps.last, let lastValue = recorded_values.last {
-            var normalizedLastTimestamp = normalizeTimestamp(lastTimestamp)
-            let normalizedCurrentTimestamp = normalizeTimestamp(timestamp)
-            let maxAllowedGap: CFTimeInterval = 0.2
-            let maxGapThreshold: CFTimeInterval = 3.0 // Avoid excessive interpolation
-            
-            if normalizedCurrentTimestamp - normalizedLastTimestamp > maxGapThreshold {
-                print("⚠️ Large gap detected (>3s), skipping interpolation to prevent unrealistic values.")
-                normalizedLastTimestamp = normalizedCurrentTimestamp // Reset to avoid flooding
-            } else {
-                while normalizedLastTimestamp + maxAllowedGap < normalizedCurrentTimestamp {
-                    let missingTimestamp = normalizeTimestamp(normalizedLastTimestamp + 0.1)
-                    recorded_values.append(lastValue)
-                    timestamps.append(missingTimestamp)
-                    droppedPacketTimestamps.append(missingTimestamp)
-                    print("⚠️ Small gap detected. Interpolating missing timestamp \(missingTimestamp) with value \(lastValue).")
-                    normalizedLastTimestamp += 0.1
-                }
-            }
-        }
-        
-        // ✅ Append new values and timestamps
+        // ✅  Automatically update MVE if a new higher value is detected
         for value in values {
-            // ✅ Detect suspiciously constant EMG values
-            if recorded_values.count > 10 {
-                let lastTenValues = recorded_values.suffix(10)
-                let maxDiff = lastTenValues.max()! - lastTenValues.min()!
-                if maxDiff < 0.0001 {
-                    print("⚠️ Warning: Minimal signal variation detected at timestamp \(timestamp). Possible sensor issue?")
+            if value > mveValue {
+                mveValue = value
+            }
+
+        // ✅ Handle Calibration Mode
+        if isCalibrating {
+            calibrationBuffer.append(contentsOf: values)
+            calibrationMVEHistory.append(values.max() ?? 0.0)
+
+            if let start = calibrationStartTime, CACurrentMediaTime() - start >= 10 {
+                endMVECalibration()
+            }
+            return  // ❗ Skip normal processing during calibration
+        }
+
+            // ✅ Move %MVE Calculation to Background Thread
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        let rmsValue = self.calculateRMS(from: values.map { Float($0) })  // Compute RMS
+                        let percentMVE = self.mveValue > 0 ? (rmsValue / Float(self.mveValue)) * 100 : 0
+                        print("📊 %MVE Calculated: \(percentMVE) | MVE Value: \(self.mveValue)")
+                        // ✅ Update UI on Main Thread (Only if NOT in calibration mode)
+                        DispatchQueue.main.async {
+                            
+                            if !self.isCalibrating {
+                                self.percentMVEHistory.append(CGFloat(percentMVE))
+                                self.recorded_rms.append(CGFloat(rmsValue)) // ✅ Ensure both are updated together
+                                
+                                // ✅ Prevent Buffer Overflow
+                                if self.percentMVEHistory.count > 500 {
+                                    self.percentMVEHistory.removeFirst(self.percentMVEHistory.count - 500)
+                                }
+                            }
+                        }
+                    }
                 }
+        
+        
+            
+            // ✅ Auto-start recording if it was inactive
+            if !recording {
+                print("⚠️ Recording was not active. Starting now...")
+                record()
             }
             
-            // ✅ Sanitize and store the value
-            let sanitizedValue = value.isFinite ? value : 0.0
-            recorded_values.append(sanitizedValue)
-            timestamps.append(normalizedTimestamp)
-            print("✅ Appended value: \(sanitizedValue), timestamp: \(normalizedTimestamp)")
-            
-            if value.isNaN {
-                print("⚠️ NaN detected at timestamp \(normalizedTimestamp). Marked as dropped packet.")
-                droppedPacketTimestamps.append(normalizedTimestamp)
-            }
-            
-            // ✅ Update RMS buffers
-            shortTermRMSBuffer.append(sanitizedValue)
-            shortTermSampleCounter += 1
-            oneSecondRMSBuffer.append(sanitizedValue)
-        }
-        
-        // ✅ Calculate short-term RMS (every 10 samples)
-        if shortTermSampleCounter >= shortTermRMSWindowSize {
-            DispatchQueue.global(qos: .background).async {
-                let shortTermRMS = self.calculateRMS(from: self.shortTermRMSBuffer.map { Float($0) })
-                DispatchQueue.main.async {
-                    self.shortTermRMSValues.append(shortTermRMS)
-                    self.shortTermRMSHistory.append(CGFloat(shortTermRMS))
-                    print("📏 Short-Term RMS Count: \(self.shortTermRMSHistory.count)")
-                }
-                self.shortTermRMSBuffer.removeAll()
-            }
-            shortTermSampleCounter = 0
-        }
-        
-        // ✅ Calculate one-second RMS (every 100 samples)
-        if oneSecondRMSBuffer.count == oneSecondRMSWindowSize {
-            let oneSecondRMS = calculateRMS(from: oneSecondRMSBuffer.map { Float($0) })
-            let validOneSecondRMS = oneSecondRMS.isFinite ? oneSecondRMS : 0.0
-            
-            DispatchQueue.main.async {
-                self.oneSecondRMSHistory.append(CGFloat(validOneSecondRMS))
-                self.recorded_rms.append(CGFloat(validOneSecondRMS))
-                print("📏 One-Second RMS Count: \(self.oneSecondRMSHistory.count)")
-                print("🔹 Last One-Second RMS Value: \(validOneSecondRMS)")
-            }
-            
-            updateMax10SecRMS(CGFloat(validOneSecondRMS))
-            oneSecondRMSBuffer.removeAll()
-        }
-        
-        // ✅ Debugging: Confirm latest timestamp and sample count
-        print("🕒 Latest Timestamp: \(timestamps.last ?? -1), Total Samples: \(timestamps.count)")
-        
-        // ✅ **Force UI Update only when values & timestamps are both valid**
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            
-            let now = CACurrentMediaTime()
-            
-            // ✅ Prevent unnecessary UI updates if there’s no new data
-            guard !values.isEmpty else {
-                print("⚠️ No new values added, skipping UI refresh.")
+            // ✅ Ensure recording is active before appending
+            guard recording else {
+                print("⚠️ Recording is not active. Data is not being appended.")
                 return
             }
             
-            // ✅ Append values efficiently
-            self.values.append(contentsOf: values.filter { $0.isFinite })
-            
-            // ✅ Prevent buffer overflow
-            let bufferLimit = min(maxBufferSize, 1000)
-            if self.values.count > bufferLimit {
-                let dropCount = self.values.count - (bufferLimit * 90 / 100) // Keep 90% of recent data
-                self.values.removeFirst(dropCount)
-                self.timestamps.removeFirst(dropCount)
-                self.recorded_values.removeFirst(dropCount)
+            // ✅ Ensure valid timestamp
+            guard timestamp.isFinite else {
+                print("❌ Invalid timestamp detected: \(timestamp). Skipping this entry.")
+                return
             }
             
-            // ✅ Throttle UI updates
-            if now - self.lastUIUpdateTime >= self.uiUpdateInterval {
-                self.lastUIUpdateTime = now
-                self.objectWillChange.send()
+            // ✅ Ensure timestamps and values stay in sync
+            if timestamps.count > recorded_values.count {
+                print("⚠️ Timestamps count (\(timestamps.count)) exceeds values count (\(recorded_values.count))! Adjusting...")
+                timestamps.removeFirst(timestamps.count - recorded_values.count)
+            } else if recorded_values.count > timestamps.count {
+                print("⚠️ Values count (\(recorded_values.count)) exceeds timestamps count (\(timestamps.count))! Adjusting...")
+                recorded_values.removeFirst(recorded_values.count - timestamps.count)
             }
+            
+            // ✅ Prevent duplicate timestamps and ensure a monotonic sequence
+            var normalizedTimestamp = normalizeTimestamp(timestamp)
+            if let lastTimestamp = timestamps.last {
+                if normalizedTimestamp - lastTimestamp < 0.002 {
+                    print("⚠️ Adjusting timestamp to prevent duplicates.")
+                    normalizedTimestamp = lastTimestamp + 0.002
+                }
+                
+                // ✅ Prevent excessive jumps in timestamps
+                if normalizedTimestamp - lastTimestamp > 10.0 {
+                    print("⚠️ Huge timestamp jump detected (>10s). Skipping to prevent UI errors.")
+                    return
+                }
+            }
+            
+            // ✅ Handle missing timestamps and packet loss (Restored original logic)
+            if let lastTimestamp = timestamps.last, let lastValue = recorded_values.last {
+                var normalizedLastTimestamp = normalizeTimestamp(lastTimestamp)
+                let normalizedCurrentTimestamp = normalizeTimestamp(timestamp)
+                let maxAllowedGap: CFTimeInterval = 0.2
+                let maxGapThreshold: CFTimeInterval = 3.0 // Avoid excessive interpolation
+                
+                if normalizedCurrentTimestamp - normalizedLastTimestamp > maxGapThreshold {
+                    print("⚠️ Large gap detected (>3s), skipping interpolation to prevent unrealistic values.")
+                    normalizedLastTimestamp = normalizedCurrentTimestamp // Reset to avoid flooding
+                } else {
+                    while normalizedLastTimestamp + maxAllowedGap < normalizedCurrentTimestamp {
+                        let missingTimestamp = normalizeTimestamp(normalizedLastTimestamp + 0.1)
+                        recorded_values.append(lastValue)
+                        timestamps.append(missingTimestamp)
+                        droppedPacketTimestamps.append(missingTimestamp)
+                        print("⚠️ Small gap detected. Interpolating missing timestamp \(missingTimestamp) with value \(lastValue).")
+                        normalizedLastTimestamp += 0.1
+                    }
+                }
+            }
+            
+            // ✅ Append new values and timestamps
+            for value in values {
+                // ✅ Detect suspiciously constant EMG values
+                if recorded_values.count > 10 {
+                    let lastTenValues = recorded_values.suffix(10)
+                    let maxDiff = lastTenValues.max()! - lastTenValues.min()!
+                    if maxDiff < 0.0001 {
+                        print("⚠️ Warning: Minimal signal variation detected at timestamp \(timestamp). Possible sensor issue?")
+                    }
+                }
+                
+                // ✅ Sanitize and store the value
+                let sanitizedValue = value.isFinite ? value : 0.0
+                recorded_values.append(sanitizedValue)
+                timestamps.append(normalizedTimestamp)
+                print("✅ Appended value: \(sanitizedValue), timestamp: \(normalizedTimestamp)")
+                
+                if value.isNaN {
+                    print("⚠️ NaN detected at timestamp \(normalizedTimestamp). Marked as dropped packet.")
+                    droppedPacketTimestamps.append(normalizedTimestamp)
+                }
+                
+                // ✅ Update RMS buffers
+                shortTermRMSBuffer.append(sanitizedValue)
+                shortTermSampleCounter += 1
+                oneSecondRMSBuffer.append(sanitizedValue)
+            }
+            
+            // ✅ Calculate short-term RMS (every 10 samples)
+            if shortTermSampleCounter >= shortTermRMSWindowSize {
+                DispatchQueue.global(qos: .background).async {
+                    let shortTermRMS = self.calculateRMS(from: self.shortTermRMSBuffer.map { Float($0) })
+                    self.shortTermRMSBuffer.removeAll()
+                    DispatchQueue.main.async {
+                        self.shortTermRMSValues.append(shortTermRMS)
+                        self.shortTermRMSHistory.append(CGFloat(shortTermRMS))
+                        print("📏 Short-Term RMS Count: \(self.shortTermRMSHistory.count)")
+                    }
+                }
+                shortTermSampleCounter = 0
+            }
+            
+            // ✅ Calculate one-second RMS (every 100 samples)
+            if oneSecondRMSBuffer.count == oneSecondRMSWindowSize {
+                let oneSecondRMS = calculateRMS(from: oneSecondRMSBuffer.map { Float($0) })
+                let validOneSecondRMS = oneSecondRMS.isFinite ? oneSecondRMS : 0.0
+            // ✅ Compute %MVE before using it
+                let percentMVE: CGFloat = mveValue > 0 ? (CGFloat(validOneSecondRMS) / mveValue) * 100 : 0
+                
+                
+                DispatchQueue.main.async {
+                    self.oneSecondRMSHistory.append(CGFloat(validOneSecondRMS))
+                    self.recorded_rms.append(CGFloat(validOneSecondRMS))
+                    self.percentMVEHistory.append(percentMVE) // ✅ Update together
+                    print("📏 One-Second RMS Count: \(self.oneSecondRMSHistory.count)")
+                    print("🔹 Last One-Second RMS Value: \(validOneSecondRMS)")
+                }
+                
+                updateMax10SecRMS(CGFloat(validOneSecondRMS))
+                oneSecondRMSBuffer.removeAll()
+            }
+            
+            // ✅ Debugging: Confirm latest timestamp and sample count
+            print("🕒 Latest Timestamp: \(timestamps.last ?? -1), Total Samples: \(timestamps.count)")
+            
+            // ✅ **Force UI Update only when values & timestamps are both valid**
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                
+                let now = CACurrentMediaTime()
+            
+                
+                // ✅ Prevent unnecessary UI updates if there’s no new data
+                guard !values.isEmpty else {
+                    print("⚠️ No new values added, skipping UI refresh.")
+                    return
+                }
+                
+                // ✅ Append values efficiently
+                self.values.append(contentsOf: values.filter { $0.isFinite })
+                
+                // ✅ Debugging: Check values and timestamps count
+                print("🔍 Debug: recorded_values count = \(self.recorded_values.count), values count = \(self.values.count), timestamps count = \(self.timestamps.count)")
+                
+                // ✅ Prevent buffer overflow
+                let bufferLimit = min(self.maxBufferSize, 1000)
+                if self.values.count > bufferLimit {
+                    let dropCount = self.values.count - (bufferLimit * 90 / 100)
+                    self.values.removeFirst(dropCount)
+                    self.timestamps.removeFirst(dropCount)
+                    self.recorded_values.removeFirst(dropCount)
+                }
+                
+                // ✅ Force UI update
+                if now - self.lastUIUpdateTime >= self.uiUpdateInterval {
+                    self.lastUIUpdateTime = now
+                    self.objectWillChange.send()
+                }
+            }
+            
         }
     }
-}
+
