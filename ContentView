@@ -7,7 +7,33 @@ struct ContentView: View {
     @State private var showingExporter = false
     @State private var isExporting = false
     @State var file_content: TextFile = TextFile(initialText: "")
+    @State private var showingDeviceSelection = false
+    @State private var isCalibrating = false  // for calibration
+    @State private var calibrationTimeRemaining = 10 // for calibration
     
+//cutomized button blue corner and then changes tto grey when is clicked on it
+    struct HighlightButtonStyle: ButtonStyle {
+        func makeBody(configuration: Configuration) -> some View {
+            configuration.label
+                .padding(6) // Reduce padding
+                .frame(width: 110, height: 40) // ✅ Force all buttons to the same size
+                .background(configuration.isPressed ? Color.gray.opacity(0.5) : Color.blue.opacity(0.8))
+                .cornerRadius(10)
+                .foregroundColor(.white)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(configuration.isPressed ? Color.gray : Color.blue, lineWidth: 2)
+                )
+                .animation(.easeInOut(duration: 0.2), value: configuration.isPressed)
+                .lineLimit(1) // ✅ Prevents multi-line truncation
+                .minimumScaleFactor(0.6) // ✅ Shrinks text instead of truncating
+                .fixedSize(horizontal: false, vertical: true) // ✅ Prevents unwanted expansion
+        }
+    }
+
+
+
+
     
     struct TextFile: FileDocument {
         static var readableContentTypes = [UTType.commaSeparatedText]
@@ -30,6 +56,7 @@ struct ContentView: View {
             return FileWrapper(regularFileWithContents: data)
         }
     }
+ 
     // Function to apply moving average smoothing
     func smoothData(values: [CGFloat], windowSize: Int) -> [CGFloat] {
         var smoothedValues: [CGFloat] = []
@@ -41,6 +68,28 @@ struct ContentView: View {
             smoothedValues.append(average)
         }
         return smoothedValues
+        
+    }
+   
+
+    // function for calibration button
+    func startCalibration() {
+        print("🔄 Starting MVE Calibration...")
+        isCalibrating = true
+        calibrationTimeRemaining = 10
+        emgGraph.startMVECalibration()
+        
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { timer in
+            if calibrationTimeRemaining > 0 {
+                print("⏳ Calibration Ongoing: \(calibrationTimeRemaining)s remaining")
+                calibrationTimeRemaining -= 1
+            } else {
+                timer.invalidate()
+                isCalibrating = false
+                print("✅ Calibration Complete. Ending MVE Calibration.")
+                emgGraph.endMVECalibration()
+            }
+        }
     }
     
     init(emgGraph: emgGraph, bleManager: BLEManager) {
@@ -53,14 +102,7 @@ struct ContentView: View {
             VStack(spacing: 10) {
                 // Raw EMG Graph
                 VStack {
-                    Text("Raw EMG Data")
-                        .font(.headline)
-                        .foregroundColor(.blue)
-                        .onAppear {
-                            print("🔄 UI Refresh (onAppear): \(emgGraph.values.count) points in view.")
-                        }
-                    
-                    // Fixed so works also for older verions of ios
+                    // Swapped: iOS 17+ Mode Title Comes First
                     if #available(iOS 17.0, *) {
                         Text("iOS 17+ Mode Active")
                             .onChange(of: emgGraph.values) { oldValue, newValue in
@@ -83,9 +125,18 @@ struct ContentView: View {
                             }
                     }
                     
+                    // Raw EMG Data" Title Comes After iOS Version
+                    Text("Raw EMG Data")
+                        .font(.headline)
+                        .foregroundColor(.blue)
+                        .onAppear {
+                            print("🔄 UI Refresh (onAppear): \(emgGraph.values.count) points in view.")
+                        }
+                    
+     
                     // ✅ The Canvas should be OUTSIDE the `if` block to ensure it always renders
                     Canvas { context, size in
-                        let smoothedValues = smoothData(values: emgGraph.values, windowSize: 5)
+                        let smoothedValues = smoothData(values: emgGraph.values, windowSize: 1)
                         let height = size.height
                         let width = size.width
                         let midY = height / 2
@@ -95,94 +146,139 @@ struct ContentView: View {
                               smoothedValues.count == emgGraph.timestamps.count else {
                             return
                         }
-
+                        
                         let firstSample = max(0, emgGraph.timestamps.count - 300)
                         let visibleTimestamps = Array(emgGraph.timestamps[firstSample..<emgGraph.timestamps.count])
                         let visibleValues = Array(smoothedValues[firstSample..<smoothedValues.count])
-
+                        
                         guard let minTime = visibleTimestamps.first,
                               let maxTime = visibleTimestamps.last,
                               maxTime > minTime else {
                             print("⚠️ Skipping Canvas draw: Invalid timestamps.")
                             return
                         }
-
+                        
                         let timeRange = maxTime - minTime
                         var path = Path()
-
+                        
                         for (index, value) in visibleValues.enumerated() {
                             let time = visibleTimestamps[index]
                             let x = ((time - minTime) / timeRange) * width
                             let y = midY - (height / 2 * value)
-
+                            
                             if index == 0 {
                                 path.move(to: CGPoint(x: x, y: y))
                             } else {
                                 path.addLine(to: CGPoint(x: x, y: y))
                             }
                         }
-
+                        
                         context.stroke(path, with: .color(.blue), lineWidth: 1.5)
                     }
                     .frame(height: geometry.size.height / 8)
                 }
-                    
-                    // 1000 Sample RMS Graph
-                    VStack {
-                        Text("1000 sample RMS")
-                            .font(.headline)
-                            .foregroundColor(.green)
-                        Canvas { context, size in
-                            let height = size.height
-                            let width = size.width
-                            let midY = height / 2
-                            let history = emgGraph.oneSecondRMSHistory.filter { $0.isFinite }
-                            
-                            guard history.count > 1 else { return }
-                            let firstSample = max(0, emgGraph.timestamps.count - history.count)
-                            let visibleTimestamps = Array(emgGraph.timestamps[firstSample..<emgGraph.timestamps.count])
-                            
-                            guard let minTime = visibleTimestamps.first,
-                                  let maxTime = visibleTimestamps.last,
-                                  maxTime > minTime else { return }
-                            
-                            let timeRange = maxTime - minTime
-                            var path = Path()
-                            
-                            for (index, value) in history.enumerated() {
-                                let time = visibleTimestamps[index]
-                                let x = ((time - minTime) / timeRange) * width
-                                let y = midY - (height / 2 * value)
-                                
-                                if index == 0 {
-                                    path.move(to: CGPoint(x: x, y: y))
-                                } else {
-                                    path.addLine(to: CGPoint(x: x, y: y))
-                                }
-                            }
-                            
-                            context.stroke(path, with: .color(.green), lineWidth: 2.0)
-                        }
-                        .frame(height: geometry.size.height / 12)
+                
+                // 1000 Sample RMS Graph
+                VStack {
+                    Text("1 second RMS")
+                        .font(.headline)
+                        .foregroundColor(.green)
+                    Canvas { context, size in
+                        let height = size.height
+                        let width = size.width
+                        let midY = height / 2
+                        let history = emgGraph.oneSecondRMSHistory.filter { $0.isFinite }
                         
+                        guard history.count > 1 else { return }
+                        let firstSample = max(0, emgGraph.timestamps.count - history.count)
+                        let visibleTimestamps = Array(emgGraph.timestamps[firstSample..<emgGraph.timestamps.count])
+                        
+                        guard let minTime = visibleTimestamps.first,
+                              let maxTime = visibleTimestamps.last,
+                              maxTime > minTime else { return }
+                        
+                        let timeRange = maxTime - minTime
+                        var path = Path()
+                        
+                        for (index, value) in history.enumerated() {
+                            let time = visibleTimestamps[index]
+                            let x = ((time - minTime) / timeRange) * width
+                            let y = midY - (height / 2 * value)
+                            
+                            if index == 0 {
+                                path.move(to: CGPoint(x: x, y: y))
+                            } else {
+                                path.addLine(to: CGPoint(x: x, y: y))
+                            }
+                        }
+                        
+                        context.stroke(path, with: .color(.green), lineWidth: 2.0)
                     }
-                    .padding(.top, 10)
+                    .frame(height: geometry.size.height / 12)
+                    
+                }
+                .padding(.top, 10)
+                // %MVE Graph
+                VStack {
+                    Text("Percentage of MVE")
+                        .font(.headline)
+                        .foregroundColor(.red)
+                    
+                    Canvas { context, size in
+                        let width = size.width
+                        let height = size.height
+                        let midY = height / 2
+                        
+                        guard !emgGraph.percentMVEHistory.isEmpty else { return }
+                        
+                        var path = Path()
+                        let maxPercentMVE = emgGraph.percentMVEHistory.max() ?? 100.0
+                        
+                        for (index, value) in emgGraph.percentMVEHistory.enumerated() {
+                            let x = CGFloat(index) / CGFloat(emgGraph.percentMVEHistory.count) * width
+                            let y = midY - (height / 2 * (value / maxPercentMVE))
+                            
+                            if index == 0 {
+                                path.move(to: CGPoint(x: x, y: y))
+                            } else {
+                                path.addLine(to: CGPoint(x: x, y: y))
+                            }
+                        }
+                        
+                        context.stroke(path, with: .color(.red), lineWidth: 1.5)
+                    }
+                    .frame(height: geometry.size.height / 12)
+                }
+                .padding(.top, 10)
+                
+                
+                VStack {
+                    
+                    Text("Current %MVE: \(String(format: "%.2f", emgGraph.percentMVEHistory.last ?? 0.0))%")
+                        .font(.headline)
+                        .foregroundColor(.green)
+                    
+                    Text("MVE: \(String(format: "%.2f", emgGraph.mveValue))")
+                        .font(.headline)
+                        .foregroundColor(.blue)
+                    
+                }
+                
+                // BLE Status and Connection
+                VStack(spacing: 10) {
                     
                     // BLE Status and Connection
                     if !bleManager.isConnected {
                         VStack {
-                            Text("Connect to Sensor")
-                                .font(.headline)
-                            List(bleManager.BLEPeripherals) { peripheral in
-                                HStack {
-                                    Text(peripheral.name).onTapGesture {
-                                        bleManager.connectSensor(p: peripheral)
-                                    }
-                                    Spacer()
-                                    Text("\(peripheral.rssi)")
-                                }
+                            // ✅ Make "Connect to Sensor" TAPABLE using a button
+                            Button(action: {
+                                showingDeviceSelection = true  // ✅ Now it correctly updates the state
+                            }) {
+                                Text("Connect to Sensor")
+                                    .frame(minWidth: 110, maxWidth: 150) // Ensure text adjusts properly
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
-                            .frame(height: geometry.size.height / 10)
+                            .buttonStyle(HighlightButtonStyle())
                         }
                     } else {
                         Text("Connected to EMGBLE2!")
@@ -194,6 +290,7 @@ struct ContentView: View {
                     VStack {
                         Text("STATUS")
                             .font(.headline)
+                        
                         if bleManager.BLEisOn {
                             Text("Bluetooth is switched on")
                                 .foregroundColor(.green)
@@ -201,45 +298,50 @@ struct ContentView: View {
                             Text("Bluetooth is NOT switched on")
                                 .foregroundColor(.red)
                         }
-                        //  display the reconnection attempts
+                        
+                        // Display the reconnection attempts
                         if bleManager.reconnectionAttempts > 0 {
                             Text("Reconnection Attempts: \(bleManager.reconnectionAttempts)/\(bleManager.maxReconnectionAttempts)")
-                                .foregroundColor(bleManager.reconnectionAttempts >= bleManager.maxReconnectionAttempts ? .red : .orange) // Amber color for attempts
+                                .foregroundColor(bleManager.reconnectionAttempts >= bleManager.maxReconnectionAttempts ? .red : .orange)
                                 .font(.subheadline)
                         }
                     }
-                    
-                    // Controls
-                    HStack {
-                        VStack(spacing: 5) {
+                }
+                
+                
+                
+                // Controls Section
+                VStack(spacing: 15) {
+                    HStack(spacing: 10) { // ✅ Reduced spacing between columns
+                        
+                        // Column 1: BLE Scanning & Sensor Control
+                        VStack(spacing: 10) {
                             Button("Start Scanning") { bleManager.startScanning() }
                                 .disabled(bleManager.isConnected)
+                                .buttonStyle(HighlightButtonStyle())
                             
                             Button("Stop Scanning") { bleManager.stopScanning() }
                                 .disabled(!bleManager.BLEisOn || bleManager.isConnected)
+                                .buttonStyle(HighlightButtonStyle())
                             
-                            Button("Reconnect Sensor") {
+                            Button("Reconnect") {
                                 if let firstPeripheral = bleManager.BLEPeripherals.first {
                                     print("🔄 Manual reconnection initiated...")
                                     bleManager.reconnectionAttempts = 0 // Reset attempts
-                                    bleManager.connectSensor(p: firstPeripheral)  // Start the connection attempt
+                                    bleManager.connectSensor(p: firstPeripheral)
                                 } else {
                                     print("⚠️ No known sensors available for reconnection.")
-                                    bleManager.startScanning()  // Restart scanning if no peripherals are found
+                                    bleManager.startScanning()
                                 }
                             }
                             .disabled(bleManager.isConnected)
-                            .padding()
-                            .background(bleManager.isConnected ? Color.gray : Color.blue)
-                            .foregroundColor(.white)
-                            .cornerRadius(10)
-                            
+                            .buttonStyle(HighlightButtonStyle())
                         }
-                        .padding()
+                        .frame(minWidth: 0, maxWidth: .infinity)// ✅ Align left
+                        .padding(.horizontal, 10) // ✅ Adds space from screen edges
                         
-                        Spacer()
-                        
-                        VStack(spacing: 5) {
+                        // Column 2: Recording & Export
+                        VStack(spacing: 10) {
                             Button("Start Recording") {
                                 DispatchQueue.global(qos: .background).async {
                                     emgGraph.record()
@@ -248,10 +350,10 @@ struct ContentView: View {
                                     }
                                 }
                             }
+                            .buttonStyle(HighlightButtonStyle())
                             
                             Button("Stop Recording") {
                                 DispatchQueue.global(qos: .background).async {
-                                    print("🔹 Stop Recording button pressed. Stopping recording...")
                                     let fileContent = emgGraph.stop_recording_and_save()
                                     DispatchQueue.main.async {
                                         file_content.text = fileContent
@@ -262,6 +364,7 @@ struct ContentView: View {
                                     }
                                 }
                             }
+                            .buttonStyle(HighlightButtonStyle())
                             
                             Button("Export last") {
                                 guard !isExporting else {
@@ -281,65 +384,89 @@ struct ContentView: View {
                                 }
                                 isExporting = false
                             }
+                            .buttonStyle(HighlightButtonStyle())
                         }
-                        .padding()
-                    }
-                    
-                    HStack {
-                        Button("Reset Graphs") {
-                            emgGraph.resetGraph()
+                        .frame(minWidth: 0, maxWidth: .infinity) // ✅ Equal width for each column
+                               .padding(.horizontal, 5)
+                        
+                        // Column 3: Graph Reset & Refresh
+                        VStack(spacing: 10) {
+                            Button("Reset Graphs") {
+                                emgGraph.resetGraph()
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                    emgGraph.objectWillChange.send()
+                                }
+                            }
+                            .buttonStyle(HighlightButtonStyle())
                             
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            Button("Refresh Graphs") {
                                 emgGraph.objectWillChange.send()
                             }
+                            .buttonStyle(HighlightButtonStyle())
                             
-                            // ✅ Add multiple placeholder values to force a refresh
-                            let fakeTimestamp = CACurrentMediaTime()
-                            print("🔄 Manually adding BLE data points after reset.")
-                            for i in 0..<15 { // Add a few points to force the graph to refresh
-                                let offsetTimestamp = fakeTimestamp + (Double(i) * 0.1)
-                                bleManager.processAndAppendEMGData([0.02], timestamp: offsetTimestamp)
+                            Button(action: startCalibration) {
+                                Text(isCalibrating ? "Calibrating... \(calibrationTimeRemaining)s" : "Calibration MVE")
+                                    .padding()
+                                    .frame(minWidth: 110, maxWidth: 150)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .multilineTextAlignment(.center) // ✅ Ensures text is properly centered
+                                    .minimumScaleFactor(0.5) // ✅ Shrinks text instead of overflowing
                             }
-                            // ✅ Confirm BLE data was appended
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                emgGraph.objectWillChange.send()
-                                print("🔄 UI Refresh forced after reset.") // Debugging
-                            }
-                            
+                            .disabled(isCalibrating)
+                            .buttonStyle(HighlightButtonStyle())
                         }
-                        .foregroundColor(.red)
-                        
-                        Spacer()
-                        
-                        Button("Refresh Graphs") {
-                            emgGraph.objectWillChange.send()
-                        }
-                        .foregroundColor(.blue)
+                        .frame(minWidth: 0, maxWidth: .infinity) // ✅ Equal width for each column
+                              .padding(.horizontal, 5) // ✅ Adds space from screen edges
                     }
-                }
-                .padding(10)
-                
-                .fileExporter(
-                    isPresented: $showingExporter,
-                    document: file_content,
-                    contentType: .commaSeparatedText,
-                    defaultFilename: "emg-data"
-                ) { result in
-                    DispatchQueue.main.async {
-                        switch result {
-                        case .success(let url):
-                            print("✅ File successfully saved to: \(url)")
-                            showingExporter = false
-                        case .failure(let error):
-                            print("❌ Failed to save file: \(error.localizedDescription)")
-                            showingExporter = false
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .alert(isPresented: $bleManager.showAlert) {
-                    Alert(title: Text("Connection Error"), message: Text(bleManager.alertMessage), dismissButton: .default(Text("OK")))
+                    .padding(.horizontal, 10) // ✅ Adds space from screen edges
                 }
             }
         }
+        
+        .fileExporter(
+            isPresented: $showingExporter,
+            document: file_content,
+            contentType: .commaSeparatedText,
+            defaultFilename: "emg-data"
+        ) { result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let url):
+                    print("✅ File successfully saved to: \(url)")
+                    showingExporter = false
+                case .failure(let error):
+                    print("❌ Failed to save file: \(error.localizedDescription)")
+                    showingExporter = false
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .alert(isPresented: $bleManager.showAlert) {
+            Alert(
+                title: Text("Connection Error"),
+                message: Text(bleManager.alertMessage),
+                dismissButton: .default(Text("OK")) {
+                    bleManager.reconnectionAttempts = 0  // ✅ Reset reconnection attempts after user acknowledges
+                }
+            )
+        }
+        .padding(.vertical, 10)
+        
+        .frame(maxWidth: .infinity, maxHeight: .infinity) // Ensures full width
+        .padding(.horizontal, 20)  // Ensures UI isn't too close to edges
+        .padding(.bottom, 10)  // Adds spacing at the bottom
+        .actionSheet(isPresented: $showingDeviceSelection) {
+            ActionSheet(
+                title: Text("Available Sensors"),
+                message: Text("Tap a device to connect"),
+                buttons: bleManager.BLEPeripherals.map { peripheral in
+                        .default(Text(peripheral.name)) {
+                            bleManager.connectSensor(p: peripheral)
+                        }
+                } + [.cancel()]
+            )
+        }
     }
+    
+}
+
