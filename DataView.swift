@@ -2,8 +2,6 @@
 //  DataView.swift
 //  HandWave
 //
-//  Created by Jóhanna Sóldís Hyström on 18.2.2025.
-//
 
 
 import SwiftUI
@@ -108,3 +106,4 @@ struct DataView: View {
         }
     }
 }
+
